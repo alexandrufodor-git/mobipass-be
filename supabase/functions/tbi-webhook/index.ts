@@ -4,13 +4,14 @@ import { makeRestClient } from "../_shared/supabaseRest.ts"
 import { sendFcm } from "../_shared/fcm.ts"
 import { sendNotification } from "../_shared/notifications.ts"
 import { rsaChunkDecrypt } from "../_shared/tbiCrypto.ts"
-import { loadTbiPrivateKey, mapTbiStatus, loanStatusMessage } from "../_shared/tbiClient.ts"
+import { loadTbiCallbackPrivateKey, mapTbiStatus, loanStatusMessage } from "../_shared/tbiClient.ts"
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+// PDF examples show status_id quoted as a string ("0", "1", "2"); accept both.
 
 interface TbiCallbackData {
   order_id: string
-  status_id: number
+  status_id: number | string
   motiv?: string
 }
 
@@ -41,8 +42,8 @@ Deno.serve(async (req) => {
       return new Response("Bad Request", { status: 400 })
     }
 
-    // 2. Decrypt with our private key
-    const privateKey = await loadTbiPrivateKey(db)
+    // 2. Decrypt with our merchant pair private key
+    const privateKey = await loadTbiCallbackPrivateKey(db)
     const decrypted = await rsaChunkDecrypt(orderData, privateKey)
     const data: TbiCallbackData = JSON.parse(decrypted)
     console.log("[tbi-webhook] received callback for order:", data.order_id, "status:", data.status_id)

@@ -3,13 +3,19 @@
 import type { RestClient } from "./supabaseRest.ts"
 
 // ─── Vault secret names ─────────────────────────────────────────────────────
+// TBI provides TWO key pairs (PDF: "Two pairs of encryption keys are provided
+// by TBI integration team"). They are NOT a matching pair:
+//   - SFTL pair: we encrypt outgoing /Finalize + /CanceledByCustomer with its
+//     public half; TBI holds the private half to decrypt.
+//   - Merchant ("Comerciant") pair: TBI encrypts ReturnToProvider callbacks
+//     with its public half; we hold the private half to decrypt.
 
 export const TBI_VAULT_KEYS = {
   USERNAME: "tbi_username",
   PASSWORD: "tbi_password",
-  STORE_ID: "tbi_store_id",           // same value used as providerCode per TBI docs
-  PUBLIC_KEY: "tbi_public_key",
-  PRIVATE_KEY: "tbi_private_key",
+  STORE_ID: "tbi_store_id",                  // also used as providerCode/encryptCode
+  OUTGOING_PUB_KEY: "tbi_outgoing_pub",      // SFTL pair public — encrypt outgoing
+  CALLBACK_PRIV_KEY: "tbi_callback_priv",    // Merchant pair private — decrypt callbacks
 } as const
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -87,15 +93,17 @@ export async function loadTbiCredentials(db: RestClient): Promise<TbiCredentials
   return { username, password, storeId }
 }
 
-export async function loadTbiPublicKey(db: RestClient): Promise<string> {
-  const key = await db.rpc<string | null>("get_vault_secret", { secret_name: TBI_VAULT_KEYS.PUBLIC_KEY })
-  if (!key) throw new Error("TBI public key not found in Vault")
+// SFTL pair public key — used to encrypt outgoing /Finalize + /CanceledByCustomer.
+export async function loadTbiOutgoingPublicKey(db: RestClient): Promise<string> {
+  const key = await db.rpc<string | null>("get_vault_secret", { secret_name: TBI_VAULT_KEYS.OUTGOING_PUB_KEY })
+  if (!key) throw new Error("TBI outgoing public key not found in Vault")
   return key
 }
 
-export async function loadTbiPrivateKey(db: RestClient): Promise<string> {
-  const key = await db.rpc<string | null>("get_vault_secret", { secret_name: TBI_VAULT_KEYS.PRIVATE_KEY })
-  if (!key) throw new Error("TBI private key not found in Vault")
+// Merchant pair private key — used to decrypt ReturnToProvider callbacks.
+export async function loadTbiCallbackPrivateKey(db: RestClient): Promise<string> {
+  const key = await db.rpc<string | null>("get_vault_secret", { secret_name: TBI_VAULT_KEYS.CALLBACK_PRIV_KEY })
+  if (!key) throw new Error("TBI callback private key not found in Vault")
   return key
 }
 
@@ -116,6 +124,7 @@ export function buildTbiPayload(
   credentials: TbiCredentials,
   profile: TbiProfileData,
   bikeName: string,
+  bikeSku: string,
   orderTotal: number,
   orderId: string,
   instalments: number,
@@ -148,7 +157,7 @@ export function buildTbiPayload(
       qty: "1",
       price: orderTotal,
       category: "2",
-      sku: orderId,
+      sku: bikeSku,
       imagelink: "",
     }],
   }
@@ -229,18 +238,37 @@ export async function submitCancellation(
 
 export type TbiLoanStatus = "pending" | "approved" | "rejected" | "canceled"
 
-export function mapTbiStatus(statusId: number, motiv?: string): TbiLoanStatus {
-  if (statusId === 1) return "approved"
-  if (statusId === 0 && motiv) return "rejected"
-  if (statusId === 0) return "canceled"
-  if (statusId === 2) return "pending"
+// PDF examples show status_id quoted as a string ("0", "1", "2"), so accept both.
+// A truthy motiv on status 0 means rejection; absent/empty motiv means cancel.
+export function mapTbiStatus(statusId: number | string, motiv?: string): TbiLoanStatus {
+  const id = typeof statusId === "string" ? Number(statusId) : statusId
+  const hasMotiv = !!(motiv && motiv.trim())
+  if (id === 1) return "approved"
+  if (id === 2) return "pending"
+  if (id === 0 && hasMotiv) return "rejected"
+  if (id === 0) return "canceled"
   return "pending"
+}
+
+// Map known TBI rejection motiv strings (from PDF) to friendlier text.
+// PDF lists only two; ask TBI integration team for the full catalogue.
+export function mapRejectionMotiv(motiv?: string): string {
+  if (!motiv) return "Your loan application was not approved."
+  const trimmed = motiv.trim()
+  switch (trimmed) {
+    case "Respins Biroul de Credit":
+      return "Loan declined by the credit bureau."
+    case "Criterii eligibilitate":
+      return "Loan declined: eligibility criteria not met."
+    default:
+      return `Loan not approved: ${trimmed}`
+  }
 }
 
 export function loanStatusMessage(status: TbiLoanStatus, motiv?: string): string {
   switch (status) {
     case "approved": return "Your loan has been approved! Your e-bike is on its way."
-    case "rejected": return motiv ? `Loan not approved: ${motiv}` : "Your loan application was not approved."
+    case "rejected": return mapRejectionMotiv(motiv)
     case "canceled": return "Your loan application has been canceled."
     case "pending": return "Your loan application is being processed."
   }

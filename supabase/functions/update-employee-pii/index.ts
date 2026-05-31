@@ -238,22 +238,44 @@ Deno.serve(async (req) => {
       return json({ ok: true, updated_fields: [] }, 200, origin)
     }
 
-    // Upsert on user_id (unique). Prefer=resolution=merge-duplicates makes PostgREST
-    // perform an UPSERT: insert if absent, update overlapping columns if present.
-    const res = await fetch(`${supabaseUrl}/rest/v1/employee_pii?on_conflict=user_id`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${serviceKey}`,
-        apikey: serviceKey,
-        "Content-Type": "application/json",
-        Prefer: "return=minimal,resolution=merge-duplicates",
-      },
-      body: JSON.stringify(row),
-    })
+    // employee_pii.user_id has a partial unique index (WHERE user_id IS NOT NULL)
+    // to allow REGES-staged rows with user_id=NULL. PostgREST's `on_conflict=`
+    // can't target a partial index, so we do the upsert manually: SELECT
+    // existing → PATCH, else POST.
+    const existing = await db.getOne<{ id: string }>(
+      "employee_pii",
+      `user_id=eq.${encodeURIComponent(targetUserId)}`,
+      "id",
+    )
+
+    let res: Response
+    if (existing) {
+      res = await fetch(`${supabaseUrl}/rest/v1/employee_pii?id=eq.${existing.id}`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${serviceKey}`,
+          apikey: serviceKey,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify(row),
+      })
+    } else {
+      res = await fetch(`${supabaseUrl}/rest/v1/employee_pii`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${serviceKey}`,
+          apikey: serviceKey,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify(row),
+      })
+    }
 
     if (!res.ok) {
       const text = await res.text().catch(() => "")
-      console.error("[update-employee-pii] upsert failed:", res.status, text)
+      console.error("[update-employee-pii] write failed:", res.status, text)
       throw json({ error: "upsert_failed" }, 500, origin)
     }
 

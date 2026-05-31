@@ -7,7 +7,7 @@ import { decrypt } from "../_shared/piiCrypto.ts"
 import { rsaChunkEncrypt } from "../_shared/tbiCrypto.ts"
 import {
   loadTbiCredentials,
-  loadTbiPublicKey,
+  loadTbiOutgoingPublicKey,
   buildTbiPayload,
   submitLoanApplication,
   type TbiProfileData,
@@ -31,8 +31,10 @@ interface BikeBenefit {
 }
 
 interface Bike {
+  id: string
   name: string
   brand: string | null
+  sku: string | null
   full_price: number
 }
 
@@ -67,7 +69,7 @@ async function loadBikeBenefit(db: RestClient, userId: string, origin?: string):
 }
 
 async function loadBike(db: RestClient, bikeId: string, origin?: string): Promise<Bike> {
-  const bike = await db.getOne<Bike>("bikes", `id=eq.${bikeId}`, "name,brand,full_price")
+  const bike = await db.getOne<Bike>("bikes", `id=eq.${bikeId}`, "id,name,brand,sku,full_price")
   if (!bike) throw badRequest(Errors.BIKE_NOT_FOUND, undefined, origin)
   return bike
 }
@@ -116,10 +118,10 @@ Deno.serve(async (req) => {
       throw badRequest({ error: "phone_required", reason: "Phone number is required for TBI loan application" }, undefined, origin)
     }
 
-    // 3. Load TBI credentials + public key
+    // 3. Load TBI credentials + outgoing public key
     const [creds, publicKey] = await Promise.all([
       loadTbiCredentials(db),
-      loadTbiPublicKey(db),
+      loadTbiOutgoingPublicKey(db),
     ]).catch(() => {
       throw json({ ...Errors.TBI_CREDENTIALS_MISSING }, 500, origin)
     })
@@ -130,6 +132,11 @@ Deno.serve(async (req) => {
     const orderTotal = benefit.employee_full_price ?? bike.full_price
     const instalments = benefit.employee_contract_months ?? 24
     const bikeName = bike.brand ? `${bike.brand} ${bike.name}` : bike.name
+    const bikeSku = bike.sku ?? bike.id
+    // TODO: once bike_orders is created at the sign_contract step (see
+    // send-contract/index.ts), read the frozen SKU + add-ons from there
+    // instead of re-deriving from bikes, and expand items[] to include
+    // helmet/insurance as separate line items when present.
 
     const tbiProfile: TbiProfileData = {
       first_name: profile.first_name,
@@ -140,7 +147,7 @@ Deno.serve(async (req) => {
       home_address: homeAddress ?? undefined,
     }
 
-    const payload = buildTbiPayload(creds, tbiProfile, bikeName, orderTotal, orderId, instalments, webhookUrl)
+    const payload = buildTbiPayload(creds, tbiProfile, bikeName, bikeSku, orderTotal, orderId, instalments, webhookUrl)
 
     // 5. Encrypt
     const encrypted = await rsaChunkEncrypt(JSON.stringify(payload), publicKey)

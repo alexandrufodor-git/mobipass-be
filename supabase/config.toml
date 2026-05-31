@@ -2,7 +2,7 @@
 # https://supabase.com/docs/guides/local-development/cli/config
 # A string used to distinguish different Supabase projects on the same host. Defaults to the
 # working directory name when running `supabase init`.
-project_id = "cod"
+project_id = "mobi-pass-be"
 
 [api]
 enabled = true
@@ -261,9 +261,11 @@ max_frequency = "5s"
 # uri = "pg-functions://postgres/auth/before-user-created-hook"
 
 # This hook runs before a token is issued and allows you to add additional claims based on the authentication method used.
-# [auth.hook.custom_access_token]
-# enabled = true
-# uri = "pg-functions://<database>/<schema>/<hook_name>"
+# Local-only: prod has this configured via the Dashboard. config.toml drives
+# `supabase start` only; pushing it does not propagate to prod.
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/custom_access_token_hook"
 
 # Configure one of the supported SMS providers: `twilio`, `twilio_verify`, `messagebird`, `textlocal`, `vonage`.
 [auth.sms.twilio]
@@ -397,7 +399,6 @@ entrypoint = "./functions/bulk-create/index.ts"
 
 [functions.register]
 enabled = true
-auth = false
 verify_jwt = false  # Public endpoint - no auth required for registration
 import_map = "./functions/register/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.

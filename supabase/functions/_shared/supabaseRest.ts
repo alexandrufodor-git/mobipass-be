@@ -4,6 +4,7 @@
 export interface RestClient {
   getOne<T>(table: string, filter: string, select?: string): Promise<T | null>
   post(table: string, body: unknown): Promise<Response>
+  upsert(table: string, body: unknown, onConflict?: string): Promise<Response>
   patch(table: string, filter: string, body: unknown): Promise<void>
   rpc<T>(funcName: string, args: unknown): Promise<T>
 }
@@ -32,6 +33,17 @@ export function makeRestClient(supabaseUrl: string, serviceKey: string): RestCli
     })
   }
 
+  async function upsert(table: string, body: unknown, onConflict?: string): Promise<Response> {
+    const url = onConflict
+      ? `${supabaseUrl}/rest/v1/${table}?on_conflict=${encodeURIComponent(onConflict)}`
+      : `${supabaseUrl}/rest/v1/${table}`
+    return fetch(url, {
+      method: "POST",
+      headers: { ...baseHeaders, Prefer: "return=minimal,resolution=merge-duplicates" },
+      body: JSON.stringify(body),
+    })
+  }
+
   async function patch(table: string, filter: string, body: unknown): Promise<void> {
     await fetch(`${supabaseUrl}/rest/v1/${table}?${filter}`, {
       method: "PATCH",
@@ -49,5 +61,5 @@ export function makeRestClient(supabaseUrl: string, serviceKey: string): RestCli
     return res.json()
   }
 
-  return { getOne, post, patch, rpc }
+  return { getOne, post, upsert, patch, rpc }
 }

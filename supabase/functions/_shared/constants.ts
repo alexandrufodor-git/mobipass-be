@@ -104,6 +104,14 @@ export const Errors = {
   // PII / employee details errors
   PII_KEY_MISSING: { error: "pii_encryption_key_missing" },
   PII_DECRYPT_FAILED: { error: "pii_decrypt_failed" },
+  // REGES JSON ingest errors
+  INVALID_REGES_FORMAT: { error: "invalid_reges_format" },
+  COMPANY_DOMAIN_NOT_CONFIGURED: { error: "company_domain_not_configured" },
+  // Confidence-based registration errors
+  AMBIGUOUS_MATCH: { error: "ambiguous_match" },
+  INVITE_INACTIVE: { error: "invite_inactive" },
+  COMPANY_NOT_FOUND_FOR_DOMAIN: { error: "company_not_found_for_domain" },
+  CHECK_DETAILS: { error: "check_details" },
 } as const
 
 export function forbidden(error = Errors.FORBIDDEN, origin?: string): Response {

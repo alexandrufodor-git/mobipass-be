@@ -37,8 +37,10 @@ interface BikeBenefit {
 }
 
 interface Bike {
+  id: string
   name: string
   brand: string | null
+  sku: string | null
   full_price: number
 }
 
@@ -101,7 +103,7 @@ async function loadBikeBenefit(db: RestClient, userId: string, origin?: string):
 }
 
 async function loadBike(db: RestClient, bikeId: string, origin?: string): Promise<Bike> {
-  const bike = await db.getOne<Bike>("bikes", `id=eq.${bikeId}`, "name,brand,full_price")
+  const bike = await db.getOne<Bike>("bikes", `id=eq.${bikeId}`, "id,name,brand,sku,full_price")
   if (!bike) throw badRequest(Errors.BIKE_NOT_FOUND, undefined, origin)
   return bike
 }
@@ -254,6 +256,27 @@ Deno.serve(async (req) => {
     )
 
     await saveContract(db, benefit.id, userId, company.esignatures_template_id!, esigResult, origin)
+
+    // Upsert bike_orders with a frozen snapshot of the bike. UPSERT (not
+    // DELETE+INSERT) on the unique_benefit_order constraint preserves any
+    // helmet/insurance flags an HR user may have set on a prior call. Only
+    // snapshot fields are written — helmet/insurance and audit fields are
+    // intentionally absent from the body.
+    const orderRes = await db.upsert("bike_orders", {
+      user_id:         userId,
+      bike_benefit_id: benefit.id,
+      bike_id:         bike.id,
+      bike_sku:        bike.sku,
+      bike_name:       bike.name,
+      bike_brand:      bike.brand,
+      bike_full_price: bike.full_price,
+      frozen_at:       new Date().toISOString(),
+    }, "bike_benefit_id")
+    if (!orderRes.ok) {
+      const details = await orderRes.text().catch(() => "")
+      throw json({ ...Errors.ESIGNATURES_API_FAILED, reason: "bike_order_upsert_failed", details }, 500, origin)
+    }
+
     await db.patch("bike_benefits", `id=eq.${benefit.id}`, {
       contract_requested_at: new Date().toISOString(),
       step: "pickup_delivery",

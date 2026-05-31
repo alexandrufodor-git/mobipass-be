@@ -63,9 +63,21 @@ drop trigger if exists "objects_insert_create_prefix" on "storage"."objects";
 
 drop trigger if exists "objects_update_create_prefix" on "storage"."objects";
 
-drop trigger if exists "prefixes_create_hierarchy" on "storage"."prefixes";
-
-drop trigger if exists "prefixes_delete_hierarchy" on "storage"."prefixes";
+-- Hosted Storage has storage.prefixes + hierarchy triggers; older/local init may not.
+-- DROP TRIGGER ... ON t still requires t to exist in Postgres (IF EXISTS applies to trigger only).
+DO $remote_schema_storage_prefixes$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+      FROM information_schema.tables
+     WHERE table_schema = 'storage'
+       AND table_name = 'prefixes'
+  ) THEN
+    DROP TRIGGER IF EXISTS "prefixes_create_hierarchy" ON "storage"."prefixes";
+    DROP TRIGGER IF EXISTS "prefixes_delete_hierarchy" ON "storage"."prefixes";
+  END IF;
+END
+$remote_schema_storage_prefixes$;
 
 -- Supabase Cloud internal triggers — function does not exist in local CLI environment.
 -- CREATE TRIGGER protect_buckets_delete BEFORE DELETE ON storage.buckets FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();

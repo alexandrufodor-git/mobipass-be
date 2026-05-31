@@ -17,6 +17,12 @@ SET search_path TO extensions, public;
 --  T12: RLS — employee cannot DELETE from employee_pii directly
 --  T13: Unique constraint on employee_pii.user_id
 --  T14: integration_configs unique constraint (company_id, integration)
+--  T15: employee_pii.user_id is nullable (REGES staging support)
+--  T16: partial unique index allows multiple NULL user_id rows
+--  T17: pending PII (user_id IS NULL) hidden from non-HR authenticated user
+--  T18: HR can SELECT own-company pending PII row
+--  T19: HR cannot SELECT other-company pending PII row
+--  T20: profile_invite_id FK exists with ON DELETE SET NULL
 -- ============================================================
 
 BEGIN;
@@ -77,7 +83,7 @@ BEGIN
 END;
 $$;
 
-SELECT plan(14);
+SELECT plan(20);
 
 -- ── T01: employee_pii table exists with encrypted columns ───────────────────
 SELECT has_table('public', 'employee_pii', 'T01a: employee_pii table exists');
@@ -261,6 +267,128 @@ SELECT throws_ok(
   '23505',  -- unique_violation
   NULL,
   'T14: integration_configs unique constraint (company_id, integration)'
+);
+
+-- ── T15: employee_pii.user_id is nullable (REGES staging support) ──────────
+SELECT col_is_null(
+  'public', 'employee_pii', 'user_id',
+  'T15: employee_pii.user_id is nullable'
+);
+
+-- ── T16: partial unique index allows multiple NULL user_id rows ────────────
+DO $$
+DECLARE
+  v_co_a uuid := current_setting('test.co_a_id')::uuid;
+BEGIN
+  -- Two pending PII rows in the same company with user_id IS NULL must coexist.
+  INSERT INTO public.employee_pii (user_id, company_id, source, source_ref_id)
+  VALUES (NULL, v_co_a, 'reges', 't16-ref-a');
+  INSERT INTO public.employee_pii (user_id, company_id, source, source_ref_id)
+  VALUES (NULL, v_co_a, 'reges', 't16-ref-b');
+END;
+$$;
+
+SELECT is(
+  (SELECT count(*)::int FROM public.employee_pii
+    WHERE user_id IS NULL
+      AND company_id = current_setting('test.co_a_id')::uuid),
+  2,
+  'T16: partial unique index allows multiple NULL user_id rows'
+);
+
+-- ── T17: pending PII row hidden from non-HR authenticated user ─────────────
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  json_build_object('sub', current_setting('test.emp_a_id'), 'role', 'authenticated', 'user_role', 'employee')::text,
+  true);
+
+SELECT ok(
+  NOT EXISTS(
+    SELECT 1 FROM public.employee_pii
+    WHERE user_id IS NULL
+      AND company_id = current_setting('test.co_a_id')::uuid
+  ),
+  'T17: employee cannot SELECT pending PII rows'
+);
+
+RESET ROLE;
+
+-- ── T18: HR can SELECT own-company pending PII row ─────────────────────────
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  json_build_object(
+    'sub',              current_setting('test.hr_a_id'),
+    'role',             'authenticated',
+    'user_role',        'hr',
+    'app_company_id',   current_setting('test.co_a_id')
+  )::text,
+  true);
+
+SELECT ok(
+  EXISTS(
+    SELECT 1 FROM public.employee_pii
+    WHERE user_id IS NULL
+      AND company_id = current_setting('test.co_a_id')::uuid
+  ),
+  'T18: HR can SELECT own-company pending PII'
+);
+
+-- ── T19: HR cannot SELECT other-company pending PII row ────────────────────
+-- Insert one pending row in co_b for this test
+RESET ROLE;
+INSERT INTO public.employee_pii (user_id, company_id, source, source_ref_id)
+VALUES (NULL, current_setting('test.co_b_id')::uuid, 'reges', 't19-ref');
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  json_build_object(
+    'sub',              current_setting('test.hr_a_id'),
+    'role',             'authenticated',
+    'user_role',        'hr',
+    'app_company_id',   current_setting('test.co_a_id')
+  )::text,
+  true);
+
+SELECT ok(
+  NOT EXISTS(
+    SELECT 1 FROM public.employee_pii
+    WHERE user_id IS NULL
+      AND company_id = current_setting('test.co_b_id')::uuid
+  ),
+  'T19: HR cannot SELECT other-company pending PII'
+);
+
+RESET ROLE;
+
+-- ── T20: profile_invite_id FK with ON DELETE SET NULL ──────────────────────
+DO $$
+DECLARE
+  v_co_a    uuid := current_setting('test.co_a_id')::uuid;
+  v_invite  uuid;
+  v_pii     uuid;
+BEGIN
+  INSERT INTO public.profile_invites (company_id, first_name, last_name, source, source_ref_id)
+  VALUES (v_co_a, 'PendingFn', 'PendingLn', 'reges', 't20-invite')
+  RETURNING id INTO v_invite;
+
+  INSERT INTO public.employee_pii (user_id, company_id, source, source_ref_id, profile_invite_id)
+  VALUES (NULL, v_co_a, 'reges', 't20-pii', v_invite)
+  RETURNING id INTO v_pii;
+
+  PERFORM set_config('test.t20_pii', v_pii::text, false);
+
+  -- Drop the invite — the FK should null out profile_invite_id, not cascade.
+  DELETE FROM public.profile_invites WHERE id = v_invite;
+END;
+$$;
+
+SELECT ok(
+  EXISTS(
+    SELECT 1 FROM public.employee_pii
+    WHERE id = current_setting('test.t20_pii')::uuid
+      AND profile_invite_id IS NULL
+  ),
+  'T20: profile_invite_id FK ON DELETE SET NULL keeps PII row, nulls the link'
 );
 
 SELECT * FROM finish();

@@ -1,6 +1,7 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { encrypt } from "../_shared/piiCrypto.ts"
+import { birthDateHash } from "../_shared/piiLookup.ts"
 import { makeRestClient } from "../_shared/supabaseRest.ts"
 
 /**
@@ -45,20 +46,31 @@ const E2E_HOME_LON          = 23.5712
 // get-employee-details returns a fully-formed `pii` block.
 const E2E_PII_NATIONAL_ID   = "1900101123456"
 const E2E_PII_DATE_OF_BIRTH = "1990-01-01"
+const REGES_GMAIL_COMPANY_ID = "44444444-4444-4444-4444-444444444444"
+const REGES_GMAIL_DOMAIN     = "gmail.com"
+// Named pattern from public.email_pattern_kind. Resolves to "{last}?{.{middle}}.{first}".
+// HR notation: {last}.{middle?}.{first}@domain — middle + its leading dot are optional.
+const REGES_EMAIL_PATTERN    = "last_middle_first"
+const E2E_REGES_SOURCE_REF   = "reges-fodor-e2e"
+const E2E_REGES_DOB          = "1990-03-15"
+const E2E_REGES_DERIVED_EMAIL = "fodor.horatiu.alexandru@gmail.com"
+const E2E_REGES_CNP          = "1900315120017"
 const E2E_PII_PHONE         = "+40712345678"
 const E2E_PII_SALARY_GROSS  = 6000
 
-type AccountKey = "fresh" | "signed" | "main" | "register"
+type AccountKey = "fresh" | "signed" | "main" | "register" | "reges"
 
 const ACCOUNTS: Record<AccountKey, { email: string; firstName: string; lastName: string }> = {
   fresh:    { email: `e2e-fresh@${TEST_DOMAIN}`,    firstName: "E2E", lastName: "Fresh" },
   signed:   { email: `e2e-signed@${TEST_DOMAIN}`,   firstName: "E2E", lastName: "Signed" },
   main:     { email: `e2e-main@${TEST_DOMAIN}`,     firstName: "E2E", lastName: "Main" },
   register: { email: `e2e-register@${TEST_DOMAIN}`, firstName: "E2E", lastName: "Register" },
+  reges:    { email: "fodor.horatiu.alexandru@gmail.com", firstName: "Alexandru", lastName: "Fodor" },
 }
 
 type FlowTarget =
   | "pre_register"
+  | "register"
   | "fresh"
   | "pickup_ready_no_address"
   | "completed_no_address"
@@ -66,6 +78,7 @@ type FlowTarget =
 
 const FLOWS: Record<string, { accounts: AccountKey[]; target: FlowTarget }> = {
   "registration":                    { accounts: ["register"], target: "pre_register" },
+  "reges-claim-register":            { accounts: ["reges"],    target: "register" },
   "onboarding-1-to-4":               { accounts: ["fresh"],    target: "fresh" },
   "onboarding-step-5":               { accounts: ["signed"],   target: "pickup_ready_no_address" },
   "onboarding-step-5-to-dashboard":  { accounts: ["signed"],   target: "pickup_ready_no_address" },
@@ -142,9 +155,19 @@ async function patch(table: string, filter: string, row: Record<string, unknown>
 }
 
 async function upsertInvite(email: string, companyId: string, firstName: string, lastName: string): Promise<void> {
-  await rest("POST", `/rest/v1/profile_invites?on_conflict=email`,
-    { email, company_id: companyId, first_name: firstName, last_name: lastName, status: "active" },
-    "resolution=merge-duplicates,return=minimal")
+  // Can't use PostgREST's on_conflict=email — the unique constraint was
+  // replaced with a partial unique index on lower(email) (REGES bridge
+  // migration) so emails can be NULL. PostgREST's on_conflict only targets
+  // real unique constraints, not partial indexes. Lookup-then-write instead.
+  const row = { email, company_id: companyId, first_name: firstName, last_name: lastName, status: "active" }
+  const existing = await rest("GET",
+    `/rest/v1/profile_invites?email=eq.${encodeURIComponent(email)}&select=id`)
+  const rows = await existing.json() as { id: string }[]
+  if (rows.length > 0) {
+    await patch("profile_invites", `id=eq.${rows[0].id}`, row)
+  } else {
+    await rest("POST", `/rest/v1/profile_invites`, row, "return=minimal")
+  }
 }
 
 // ─── Auth admin helpers ──────────────────────────────────────────────────────
@@ -268,6 +291,74 @@ async function deleteAccountIfExists(acct: AccountKey): Promise<void> {
 }
 
 // ─── Target state appliers ──────────────────────────────────────────────────
+
+async function ensureRegesGmailCompany(): Promise<string> {
+  const existing = await getOne<{ id: string }>(
+    "companies",
+    `id=eq.${REGES_GMAIL_COMPANY_ID}`,
+    "id",
+  )
+  if (existing?.id) {
+    await patch("companies", `id=eq.${existing.id}`, {
+      email_domain:  REGES_GMAIL_DOMAIN,
+      email_pattern: REGES_EMAIL_PATTERN,
+    })
+    return existing.id
+  }
+  throw new Error(
+    `RegesGmail company ${REGES_GMAIL_COMPANY_ID} not found — run supabase db reset`,
+  )
+}
+
+/** Pending REGES invite + PII for Maestro reges-claim-register (no auth user). */
+async function resetToRegesPending(companyId: string): Promise<void> {
+  const db = makeRestClient(SUPABASE_URL, SERVICE_ROLE_KEY)
+
+  await patch("companies", `id=eq.${companyId}`, {
+    email_domain:  REGES_GMAIL_DOMAIN,
+    email_pattern: REGES_EMAIL_PATTERN,
+  })
+
+  await del("employee_pii",
+    `company_id=eq.${companyId}&source=eq.reges&source_ref_id=eq.${E2E_REGES_SOURCE_REF}`)
+  await del("profile_invites",
+    `company_id=eq.${companyId}&source=eq.reges&source_ref_id=eq.${E2E_REGES_SOURCE_REF}`)
+
+  const dobHash = await birthDateHash(db, E2E_REGES_DOB)
+  const [nationalIdEnc, dobEnc] = await Promise.all([
+    encrypt(db, E2E_REGES_CNP),
+    encrypt(db, E2E_REGES_DOB),
+  ])
+
+  const inviteRes = await rest("POST", `/rest/v1/profile_invites`, {
+    company_id:      companyId,
+    email:           null,
+    source:          "reges",
+    source_ref_id:   E2E_REGES_SOURCE_REF,
+    first_name:      "ALEXANDRU-HORATIU",
+    last_name:       "FODOR",
+    birth_date_hash: dobHash,
+    derived_email:   E2E_REGES_DERIVED_EMAIL,
+    radiat:          false,
+    status:          "active",
+  }, "return=representation")
+  const invite = (await inviteRes.json() as { id: string }[])[0]
+  if (!invite?.id) throw new Error("profile_invites insert returned no row")
+
+  await rest("POST", `/rest/v1/employee_pii`, {
+    company_id:              companyId,
+    profile_invite_id:       invite.id,
+    source:                  "reges",
+    source_ref_id:           E2E_REGES_SOURCE_REF,
+    user_id:                 null,
+    national_id_encrypted:   nationalIdEnc,
+    date_of_birth_encrypted: dobEnc,
+    country:                 "RO",
+    nationality_iso:         "RO",
+    country_of_domicile_iso: "RO",
+    id_document_type:        "national_id",
+  }, "return=minimal")
+}
 
 async function resetToFresh(userId: string): Promise<void> {
   await del("contracts",     `user_id=eq.${userId}`)
@@ -443,6 +534,14 @@ async function reset(flowName: string): Promise<Record<string, unknown>> {
       await deleteAccountIfExists(acct)
       await upsertInvite(ACCOUNTS[acct].email, companyId, ACCOUNTS[acct].firstName, ACCOUNTS[acct].lastName)
       result[ACCOUNTS[acct].email] = "pre_register"
+      continue
+    }
+    if (spec.target === "register") {
+      const regesCompanyId = await ensureRegesGmailCompany()
+      await deleteAccountIfExists(acct)
+      await del("profile_invites", `email=eq.${encodeURIComponent(ACCOUNTS[acct].email)}`)
+      await resetToRegesPending(regesCompanyId)
+      result[ACCOUNTS[acct].email] = "register"
       continue
     }
     const uid = await ensureAccount(acct, companyId)

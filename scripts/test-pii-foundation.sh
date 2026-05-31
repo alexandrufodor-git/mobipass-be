@@ -137,9 +137,11 @@ done
 
 section "Database: Constraints"
 
-# Unique constraint on employee_pii.user_id
-UNIQUE_PII=$($PSQL -c "SELECT count(*) FROM information_schema.table_constraints WHERE table_schema='public' AND table_name='employee_pii' AND constraint_type='UNIQUE';")
-check "employee_pii has UNIQUE constraint" "$([ "$UNIQUE_PII" -ge "1" ] && echo true || echo false)"
+# Unique guarantee on employee_pii.user_id. After REGES bridge migration this is a
+# partial unique INDEX (WHERE user_id IS NOT NULL), not a table constraint —
+# allows staged rows with NULL user_id while still preventing duplicates per user.
+UNIQUE_PII=$($PSQL -c "SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND tablename='employee_pii' AND indexname='employee_pii_user_unique';")
+check "employee_pii has UNIQUE index on user_id" "$([ "$UNIQUE_PII" -ge "1" ] && echo true || echo false)"
 
 # Unique constraint on integration_configs (company_id, integration)
 UNIQUE_IC=$($PSQL -c "SELECT count(*) FROM information_schema.table_constraints WHERE table_schema='public' AND table_name='integration_configs' AND constraint_type='UNIQUE';")
@@ -253,9 +255,11 @@ else
     ON CONFLICT (user_id) DO NOTHING;
     INSERT INTO user_roles (user_id, role) VALUES ('$ADMIN_ID', 'admin')
     ON CONFLICT (user_id, role) DO NOTHING;
+    -- employee_pii.user_id has a partial unique index (WHERE user_id IS NOT NULL).
+    -- Use the index predicate so ON CONFLICT can target it.
     INSERT INTO employee_pii (user_id, company_id, phone_encrypted, home_address_encrypted, source)
     VALUES ('$EMP_ID', '$COMPANY_ID', '+40700000000', 'Str. Test 1', 'test-backfill')
-    ON CONFLICT (user_id) DO UPDATE SET
+    ON CONFLICT (user_id) WHERE user_id IS NOT NULL DO UPDATE SET
       phone_encrypted        = EXCLUDED.phone_encrypted,
       home_address_encrypted = EXCLUDED.home_address_encrypted,
       source                 = 'test-backfill';

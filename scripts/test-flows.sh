@@ -120,7 +120,7 @@ seed_test_data() {
         '+40722123456', '1900101123456',
         'Str. Exemplu Nr. 42, Bucuresti', '44.4500', '26.0800',
         'manual');" > /dev/null
-    pass "Created employee_pii (plaintext — safeDecrypt handles it)"
+    pass "Created employee_pii (plaintext — encrypted below)"
   else
     # Make sure CNP + phone are populated
     db "UPDATE employee_pii SET
@@ -144,9 +144,50 @@ seed_test_data() {
     pass "profile_invite exists for employee"
   fi
 
+  encrypt_seeded_pii
+
   sep
   log "Seed complete."
   echo ""
+}
+
+# ── Encrypt seeded PII via admin-encrypt-pii ────────────────────────────────
+# tbi-loan-request and other consumers use strict decrypt() which requires the
+# enc:v1: marker. Without this step they 500 with "Value is not encrypted".
+# Idempotent: skipped on rows already encrypted. Temporarily promotes the
+# employee to admin to call the gated endpoint, then reverts.
+encrypt_seeded_pii() {
+  log "Encrypting seeded PII (admin-encrypt-pii)..."
+
+  # Skip if already encrypted (no work to do).
+  local enc_count
+  enc_count=$(db "SELECT count(*) FROM employee_pii
+                  WHERE user_id = '${EMPLOYEE_ID}'
+                    AND phone_encrypted LIKE 'enc:v1:%'
+                    AND national_id_encrypted LIKE 'enc:v1:%';")
+  if [ "$enc_count" = "1" ]; then
+    pass "PII already encrypted — skipping"
+    return
+  fi
+
+  db "UPDATE user_roles SET role='admin' WHERE user_id='${EMPLOYEE_ID}';" > /dev/null
+  local admin_jwt
+  admin_jwt=$(generate_jwt "$EMPLOYEE_ID" "admin")
+
+  local resp
+  resp=$(curl -sS -X POST "${FUNCTIONS_URL}/admin-encrypt-pii" \
+    -H "Authorization: Bearer ${admin_jwt}" \
+    -H "Content-Type: application/json" \
+    -d '{}')
+
+  db "UPDATE user_roles SET role='employee' WHERE user_id='${EMPLOYEE_ID}';" > /dev/null
+
+  if echo "$resp" | grep -q '"updated_rows"'; then
+    pass "PII encrypted: $resp"
+  else
+    fail "admin-encrypt-pii failed: $resp"
+    return 1
+  fi
 }
 
 # ============================================================

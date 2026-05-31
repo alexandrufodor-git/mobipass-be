@@ -17,12 +17,20 @@ const IV_BYTES = 12
 const CIPHERTEXT_PREFIX = "enc:v1:"
 const VAULT_KEY_NAME = "pii_encryption_key"
 
-// Cached CryptoKey for the lifetime of the edge function invocation.
+// Cached values for the lifetime of the edge function invocation.
 let _cachedKey: CryptoKey | null = null
+let _cachedKeyBytes: Uint8Array<ArrayBuffer> | null = null
 
-/** Load the AES-256-GCM key: Vault first, env var fallback. Cached per instance. */
-export async function getEncryptionKey(db: RestClient): Promise<CryptoKey> {
-  if (_cachedKey) return _cachedKey
+/**
+ * Load the raw 32-byte PII key from Vault (preferred) or PII_ENCRYPTION_KEY
+ * env var (local dev fallback). Cached per instance.
+ *
+ * Exposed for callers that need the raw bytes for a different WebCrypto
+ * algorithm (e.g. HMAC-SHA256 for blind indexes — see piiLookup.ts).
+ * AES-GCM encrypt/decrypt callers should use getEncryptionKey() instead.
+ */
+export async function loadPiiKey(db: RestClient): Promise<Uint8Array<ArrayBuffer>> {
+  if (_cachedKeyBytes) return _cachedKeyBytes
 
   // Prefer Vault (production). Fall back to env var for local dev where
   // vault.create_secret may not be set up.
@@ -34,10 +42,27 @@ export async function getEncryptionKey(db: RestClient): Promise<CryptoKey> {
     throw new Error("PII encryption key not found in Vault (pii_encryption_key) or env (PII_ENCRYPTION_KEY)")
   }
 
-  const keyBytes = Uint8Array.from(atob(keyB64), (c) => c.charCodeAt(0))
-  if (keyBytes.length !== 32) {
-    throw new Error(`PII encryption key must be exactly 32 bytes (got ${keyBytes.length})`)
+  const decoded = atob(keyB64)
+  if (decoded.length !== 32) {
+    throw new Error(`PII encryption key must be exactly 32 bytes (got ${decoded.length})`)
   }
+
+  // Build on an explicit ArrayBuffer so WebCrypto's importKey accepts the
+  // BufferSource without needing a cast (Uint8Array<ArrayBufferLike> is too
+  // wide for the BufferSource overload under strict lib types).
+  const buf = new ArrayBuffer(32)
+  const keyBytes = new Uint8Array(buf)
+  for (let i = 0; i < 32; i++) keyBytes[i] = decoded.charCodeAt(i)
+
+  _cachedKeyBytes = keyBytes
+  return _cachedKeyBytes
+}
+
+/** Load the AES-256-GCM key: Vault first, env var fallback. Cached per instance. */
+export async function getEncryptionKey(db: RestClient): Promise<CryptoKey> {
+  if (_cachedKey) return _cachedKey
+
+  const keyBytes = await loadPiiKey(db)
 
   _cachedKey = await crypto.subtle.importKey(
     "raw",

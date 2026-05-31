@@ -6,7 +6,7 @@ import { makeRestClient } from "../_shared/supabaseRest.ts"
 import { rsaChunkEncrypt } from "../_shared/tbiCrypto.ts"
 import {
   loadTbiCredentials,
-  loadTbiPublicKey,
+  loadTbiOutgoingPublicKey,
   buildTbiCancelPayload,
   submitCancellation,
 } from "../_shared/tbiClient.ts"
@@ -49,10 +49,10 @@ Deno.serve(async (req) => {
       throw badRequest(Errors.LOAN_NOT_CANCELABLE, { current_status: loan.status }, origin)
     }
 
-    // 2. Load credentials + public key
+    // 2. Load credentials + outgoing public key
     const [creds, publicKey] = await Promise.all([
       loadTbiCredentials(db),
-      loadTbiPublicKey(db),
+      loadTbiOutgoingPublicKey(db),
     ])
 
     // 3. Build and encrypt cancel payload (TBI format: orderId, statusId, username, password)

@@ -76,16 +76,6 @@ COMMENT ON TYPE "public"."bike_type" IS 'Types of electric bikes available in th
 
 
 
-CREATE TYPE "public"."company_name" AS ENUM (
-    '8x8',
-    'BigTech1',
-    'SmallTech2'
-);
-
-
-ALTER TYPE "public"."company_name" OWNER TO "postgres";
-
-
 CREATE TYPE "public"."contract_status" AS ENUM (
     'pending',
     'viewed_by_employee',
@@ -115,6 +105,18 @@ ALTER TYPE "public"."currency_type" OWNER TO "postgres";
 
 COMMENT ON TYPE "public"."currency_type" IS 'Supported currencies. EUR: symbol €  |  RON: symbol RON';
 
+
+
+CREATE TYPE "public"."email_pattern_kind" AS ENUM (
+    'last_middle_first',
+    'first_middle_last',
+    'first_last',
+    'last_first',
+    'first_initial_last'
+);
+
+
+ALTER TYPE "public"."email_pattern_kind" OWNER TO "postgres";
 
 
 CREATE TYPE "public"."notification_event" AS ENUM (
@@ -401,11 +403,13 @@ DECLARE
   v_description text;
   v_department  text;
   v_hire_date   bigint;
+  v_invite_id   uuid;
 BEGIN
   IF NEW.email_confirmed_at IS NOT NULL THEN
 
     -- 1. Resolve company_id and employee fields from profile_invites
     SELECT
+      pi.id,
       pi.company_id,
       pi.first_name,
       pi.last_name,
@@ -413,6 +417,7 @@ BEGIN
       pi.department,
       pi.hire_date
     INTO
+      v_invite_id,
       v_company_id,
       v_first_name,
       v_last_name,
@@ -456,6 +461,13 @@ BEGIN
     SET status = 'active'::public.user_profile_status
     WHERE LOWER(email) = LOWER(NEW.email);
 
+    -- 4.5. Link any pending REGES PII to this user
+    UPDATE public.employee_pii
+       SET user_id    = NEW.id,
+           updated_at = now()
+     WHERE profile_invite_id = v_invite_id
+       AND user_id IS NULL;
+
     -- 5. Create bike benefit
     INSERT INTO public.bike_benefits (user_id)
     VALUES (NEW.id)
@@ -481,6 +493,196 @@ $$;
 
 
 ALTER FUNCTION "public"."handle_user_registration"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  rec               jsonb;
+  v_invite_id       uuid;
+  v_pii_id          uuid;
+  v_invite_status   text;
+  v_pii_status      text;
+  v_was_radiat      boolean;
+  v_existing_email  text;
+  v_existing_user   uuid;
+  out_results       jsonb := '[]'::jsonb;
+BEGIN
+  FOR rec IN SELECT * FROM jsonb_array_elements(p_records)
+  LOOP
+    -- 1. profile_invites upsert (claim-aware) -----------------------------
+    SELECT id, email, radiat
+      INTO v_invite_id, v_existing_email, v_was_radiat
+      FROM profile_invites
+     WHERE company_id    = p_company_id
+       AND source        = 'reges'
+       AND source_ref_id = rec->>'source_ref_id'
+     FOR UPDATE;
+
+    IF v_invite_id IS NULL THEN
+      INSERT INTO profile_invites (
+        company_id, email, source, source_ref_id,
+        first_name, last_name,
+        birth_date_hash, derived_email, radiat
+      ) VALUES (
+        p_company_id, NULL, 'reges', rec->>'source_ref_id',
+        rec->>'first_name', rec->>'last_name',
+        rec->>'birth_date_hash', rec->>'derived_email',
+        COALESCE((rec->>'radiat')::boolean, false)
+      ) RETURNING id INTO v_invite_id;
+      v_invite_status := 'created';
+
+    ELSIF v_existing_email IS NOT NULL THEN
+      -- Already claimed by a human. Surface radiat transition if it flipped.
+      IF COALESCE((rec->>'radiat')::boolean, false) AND NOT v_was_radiat THEN
+        UPDATE profile_invites
+           SET radiat = true
+         WHERE id = v_invite_id;
+        INSERT INTO company_notifications (company_id, event, event_type, payload)
+        VALUES (
+          p_company_id, 'user_update', 'reges_terminated',
+          jsonb_build_object('invite_id', v_invite_id,
+                             'email',     v_existing_email,
+                             'employee_name',
+                               COALESCE(rec->>'first_name', '') || ' ' ||
+                               COALESCE(rec->>'last_name', ''))
+        );
+      END IF;
+      v_invite_status := 'skipped_claimed';
+
+    ELSE
+      UPDATE profile_invites SET
+        first_name      = rec->>'first_name',
+        last_name       = rec->>'last_name',
+        birth_date_hash = rec->>'birth_date_hash',
+        derived_email   = rec->>'derived_email',
+        radiat          = COALESCE((rec->>'radiat')::boolean, false)
+      WHERE id = v_invite_id;
+      v_invite_status := 'updated';
+    END IF;
+
+    -- 2. employee_pii upsert (claim-aware) --------------------------------
+    SELECT id, user_id
+      INTO v_pii_id, v_existing_user
+      FROM employee_pii
+     WHERE company_id    = p_company_id
+       AND source        = 'reges'
+       AND source_ref_id = rec->>'source_ref_id'
+     FOR UPDATE;
+
+    IF v_pii_id IS NULL THEN
+      INSERT INTO employee_pii (
+        company_id, profile_invite_id, source, source_ref_id, country,
+        national_id_encrypted, home_address_encrypted, date_of_birth_encrypted,
+        locality_code, locality_code_system,
+        nationality_iso, country_of_domicile_iso, id_document_type
+      ) VALUES (
+        p_company_id, v_invite_id, 'reges', rec->>'source_ref_id', 'RO',
+        rec->>'national_id_encrypted',
+        rec->>'home_address_encrypted',
+        rec->>'date_of_birth_encrypted',
+        rec->>'locality_code', rec->>'locality_code_system',
+        rec->>'nationality_iso', rec->>'country_of_domicile_iso',
+        rec->>'id_document_type'
+      ) RETURNING id INTO v_pii_id;
+      v_pii_status := 'created';
+
+    ELSIF v_existing_user IS NOT NULL THEN
+      v_pii_status := 'skipped_claimed';
+
+    ELSE
+      UPDATE employee_pii SET
+        profile_invite_id       = v_invite_id,
+        national_id_encrypted   = rec->>'national_id_encrypted',
+        home_address_encrypted  = rec->>'home_address_encrypted',
+        date_of_birth_encrypted = rec->>'date_of_birth_encrypted',
+        locality_code           = rec->>'locality_code',
+        locality_code_system    = rec->>'locality_code_system',
+        nationality_iso         = rec->>'nationality_iso',
+        country_of_domicile_iso = rec->>'country_of_domicile_iso',
+        id_document_type        = rec->>'id_document_type'
+      WHERE id = v_pii_id;
+      v_pii_status := 'updated';
+    END IF;
+
+    -- 3. integration_messages audit row -----------------------------------
+    INSERT INTO integration_messages (
+      company_id, integration, operation, entity_type, entity_id,
+      direction, status, result_code, result_payload, processed_at
+    ) VALUES (
+      p_company_id, 'reges', 'import_employee', 'employee_pii', v_pii_id,
+      'inbound', 'success',
+      v_pii_status,
+      jsonb_build_object('invite_status', v_invite_status,
+                         'source_ref_id', rec->>'source_ref_id',
+                         'derived_email_set', (rec->>'derived_email' IS NOT NULL)),
+      now()
+    );
+
+    -- 4. Per-record outcome ----------------------------------------------
+    out_results := out_results || jsonb_build_object(
+      'source_ref_id',   rec->>'source_ref_id',
+      'status',          v_pii_status,
+      'invite_id',       v_invite_id,
+      'employee_pii_id', v_pii_id,
+      'invite_status',   v_invite_status
+    );
+  END LOOP;
+
+  RETURN out_results;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") RETURNS TABLE("id" "uuid", "radiat" boolean, "email_derived_match" boolean, "dob_matched" boolean, "first_score" real, "last_score" real)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    pi.id,
+    pi.radiat,
+    (pi.derived_email IS NOT NULL
+       AND lower(pi.derived_email) = p_email_lower) AS email_derived_match,
+    (pi.birth_date_hash = p_dob_hash)                AS dob_matched,
+    GREATEST(
+      similarity(lower(pi.first_name), p_first_norm),
+      CASE
+        WHEN lower(pi.first_name) LIKE p_first_norm || '-%'
+          OR lower(pi.first_name) LIKE p_first_norm || ' %' THEN 0.95
+        WHEN p_first_norm = ANY(string_to_array(
+               regexp_replace(lower(pi.first_name), '[-\s]+', '|', 'g'), '|'))
+          THEN 0.90
+        ELSE 0
+      END,
+      CASE
+        WHEN p_first_norm LIKE lower(pi.first_name) || ' %'
+          OR p_first_norm LIKE lower(pi.first_name) || '-%' THEN 0.95
+        ELSE 0
+      END
+    )::real AS first_score,
+    similarity(lower(pi.last_name), p_last_norm)::real AS last_score
+  FROM profile_invites pi
+  WHERE pi.email IS NULL
+    AND pi.company_id = p_company_id
+    AND (
+      pi.birth_date_hash = p_dob_hash
+      OR (pi.derived_email IS NOT NULL AND lower(pi.derived_email) = p_email_lower)
+    )
+  ORDER BY
+    (pi.derived_email IS NOT NULL AND lower(pi.derived_email) = p_email_lower) DESC,
+    (pi.birth_date_hash = p_dob_hash) DESC,
+    similarity(lower(pi.first_name), p_first_norm) DESC,
+    similarity(lower(pi.last_name),  p_last_norm)  DESC
+  LIMIT 10;
+$$;
+
+
+ALTER FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."sync_avatar_to_profile"() RETURNS "trigger"
@@ -791,11 +993,41 @@ CREATE TABLE IF NOT EXISTS "public"."bike_orders" (
     "helmet" boolean DEFAULT false NOT NULL,
     "insurance" boolean DEFAULT false NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "bike_id" "uuid",
+    "bike_sku" "text",
+    "bike_name" "text",
+    "bike_brand" "text",
+    "bike_full_price" numeric(10,2),
+    "frozen_at" timestamp with time zone
 );
 
 
 ALTER TABLE "public"."bike_orders" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."bike_orders"."bike_id" IS 'Snapshot of bikes.id at contract creation. SET NULL on bike delete so the order audit row survives.';
+
+
+
+COMMENT ON COLUMN "public"."bike_orders"."bike_sku" IS 'Frozen bike SKU at contract creation.';
+
+
+
+COMMENT ON COLUMN "public"."bike_orders"."bike_name" IS 'Frozen bike name at contract creation.';
+
+
+
+COMMENT ON COLUMN "public"."bike_orders"."bike_brand" IS 'Frozen bike brand at contract creation.';
+
+
+
+COMMENT ON COLUMN "public"."bike_orders"."bike_full_price" IS 'Frozen full price at contract creation. Decoupled from later bikes.full_price changes.';
+
+
+
+COMMENT ON COLUMN "public"."bike_orders"."frozen_at" IS 'When the snapshot was last refreshed by send-contract.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."bikes" (
@@ -838,7 +1070,7 @@ COMMENT ON COLUMN "public"."bikes"."type" IS 'Type/category of the bike (e.g., e
 CREATE TABLE IF NOT EXISTS "public"."companies" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "name" "public"."company_name" NOT NULL,
+    "name" "text" NOT NULL,
     "description" "text",
     "monthly_benefit_subsidy" numeric(10,2) DEFAULT 72.00,
     "contract_months" integer DEFAULT 36,
@@ -849,7 +1081,9 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "address_lat" double precision,
     "address_lon" double precision,
     "contact_email" "text",
-    "days_in_office" integer DEFAULT 5
+    "days_in_office" integer DEFAULT 5,
+    "email_domain" "text",
+    "email_pattern" "public"."email_pattern_kind"
 );
 
 
@@ -877,6 +1111,14 @@ COMMENT ON COLUMN "public"."companies"."esignatures_template_id" IS 'eSignatures
 
 
 COMMENT ON COLUMN "public"."companies"."days_in_office" IS 'Number of days per week employees commute to the office (1-7). Used for dashboard estimations (distance, calories, CO2, fuel saved).';
+
+
+
+COMMENT ON COLUMN "public"."companies"."email_domain" IS 'Primary corporate email domain (e.g. "8x8.com"). Used at registration to scope claim-by-name lookup. Required before REGES upload for that company.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."email_pattern" IS 'Optional named email pattern used to derive employee email at REGES ingest. NULL = no derivation (employees self-claim by name/DOB). Template lookup lives in TS (EMAIL_PATTERN_TEMPLATES).';
 
 
 
@@ -1052,7 +1294,7 @@ COMMENT ON COLUMN "public"."contracts"."last_webhook_event" IS 'Event string fro
 
 CREATE TABLE IF NOT EXISTS "public"."employee_pii" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "user_id" "uuid" NOT NULL,
+    "user_id" "uuid",
     "company_id" "uuid" NOT NULL,
     "national_id_encrypted" "text",
     "date_of_birth_encrypted" "text",
@@ -1072,11 +1314,16 @@ CREATE TABLE IF NOT EXISTS "public"."employee_pii" (
     "source" "text",
     "source_ref_id" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "profile_invite_id" "uuid"
 );
 
 
 ALTER TABLE "public"."employee_pii" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."employee_pii"."profile_invite_id" IS 'Links a REGES-staged PII row to its profile_invites row. Lets handle_user_registration backfill employee_pii.user_id when the matching invite is claimed.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."integration_configs" (
@@ -1146,7 +1393,7 @@ ALTER TABLE "public"."labor_contracts" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."profile_invites" (
-    "email" "text" NOT NULL,
+    "email" "text",
     "status" "public"."user_profile_status" DEFAULT 'inactive'::"public"."user_profile_status" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
@@ -1156,7 +1403,12 @@ CREATE TABLE IF NOT EXISTS "public"."profile_invites" (
     "last_name" "text" NOT NULL,
     "description" "text",
     "department" "text",
-    "hire_date" bigint
+    "hire_date" bigint,
+    "source" "text" DEFAULT 'manual'::"text" NOT NULL,
+    "source_ref_id" "text",
+    "birth_date_hash" "text",
+    "derived_email" "text",
+    "radiat" boolean DEFAULT false NOT NULL
 );
 
 
@@ -1187,6 +1439,26 @@ COMMENT ON COLUMN "public"."profile_invites"."hire_date" IS 'Employee hire date 
 
 
 
+COMMENT ON COLUMN "public"."profile_invites"."source" IS 'Origin of the invite: ''manual'' (CSV) or ''reges'' (JSON upload).';
+
+
+
+COMMENT ON COLUMN "public"."profile_invites"."source_ref_id" IS 'Source-system reference. For REGES: referintaSalariat.id (UUID). Idempotency key.';
+
+
+
+COMMENT ON COLUMN "public"."profile_invites"."birth_date_hash" IS 'HMAC-SHA256 blind index of ISO-formatted DOB. Always populated for REGES rows (derived from CNP positions 2-7). NULL for CSV rows.';
+
+
+
+COMMENT ON COLUMN "public"."profile_invites"."derived_email" IS 'Email derived from companies.email_pattern at REGES ingest. Used at /register for confident pattern-based claim. NULL when company has no pattern or derivation failed.';
+
+
+
+COMMENT ON COLUMN "public"."profile_invites"."radiat" IS 'REGES "radiat" (terminated) flag. true once the employee has been removed from the registry.';
+
+
+
 CREATE OR REPLACE VIEW "public"."profile_invites_with_details" WITH ("security_invoker"='on') AS
  SELECT "pi"."id" AS "invite_id",
     "pi"."email",
@@ -1209,7 +1481,10 @@ CREATE OR REPLACE VIEW "public"."profile_invites_with_details" WITH ("security_i
     "bb"."contract_status",
     COALESCE("bb"."updated_at", "bo"."updated_at", "p"."created_at", "pi"."created_at") AS "last_modified_at",
     "bb"."bike_id",
-    "bo"."id" AS "order_id"
+    "bo"."id" AS "order_id",
+    "pi"."source",
+    "pi"."radiat",
+    "pi"."derived_email"
    FROM ((((("public"."profile_invites" "pi"
      LEFT JOIN "public"."companies" "c" ON (("pi"."company_id" = "c"."id")))
      LEFT JOIN "public"."profiles" "p" ON (("pi"."email" = "p"."email")))
@@ -1306,6 +1581,11 @@ ALTER TABLE ONLY "public"."bikes"
 
 
 ALTER TABLE ONLY "public"."companies"
+    ADD CONSTRAINT "companies_name_key" UNIQUE ("name");
+
+
+
+ALTER TABLE ONLY "public"."companies"
     ADD CONSTRAINT "companies_pkey" PRIMARY KEY ("id");
 
 
@@ -1335,11 +1615,6 @@ ALTER TABLE ONLY "public"."employee_pii"
 
 
 
-ALTER TABLE ONLY "public"."employee_pii"
-    ADD CONSTRAINT "employee_pii_user_unique" UNIQUE ("user_id");
-
-
-
 ALTER TABLE ONLY "public"."integration_configs"
     ADD CONSTRAINT "integration_configs_company_integration_unique" UNIQUE ("company_id", "integration");
 
@@ -1357,11 +1632,6 @@ ALTER TABLE ONLY "public"."integration_messages"
 
 ALTER TABLE ONLY "public"."labor_contracts"
     ADD CONSTRAINT "labor_contracts_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."profile_invites"
-    ADD CONSTRAINT "profile_invites_email_key" UNIQUE ("email");
 
 
 
@@ -1412,6 +1682,18 @@ ALTER TABLE ONLY "public"."bike_orders"
 
 ALTER TABLE ONLY "public"."user_roles"
     ADD CONSTRAINT "user_roles_pkey" PRIMARY KEY ("id");
+
+
+
+CREATE UNIQUE INDEX "companies_email_domain_unique" ON "public"."companies" USING "btree" ("lower"("email_domain")) WHERE ("email_domain" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "employee_pii_source_unique" ON "public"."employee_pii" USING "btree" ("company_id", "source", "source_ref_id") WHERE ("source_ref_id" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "employee_pii_user_unique" ON "public"."employee_pii" USING "btree" ("user_id") WHERE ("user_id" IS NOT NULL);
 
 
 
@@ -1471,6 +1753,10 @@ CREATE INDEX "idx_employee_pii_company" ON "public"."employee_pii" USING "btree"
 
 
 
+CREATE INDEX "idx_employee_pii_profile_invite" ON "public"."employee_pii" USING "btree" ("profile_invite_id") WHERE ("profile_invite_id" IS NOT NULL);
+
+
+
 CREATE INDEX "idx_integration_messages_company" ON "public"."integration_messages" USING "btree" ("company_id");
 
 
@@ -1496,6 +1782,18 @@ CREATE INDEX "idx_labor_contracts_user" ON "public"."labor_contracts" USING "btr
 
 
 CREATE INDEX "idx_profile_invites_company_id" ON "public"."profile_invites" USING "btree" ("company_id");
+
+
+
+CREATE INDEX "idx_profile_invites_derived_email" ON "public"."profile_invites" USING "btree" ("company_id", "lower"("derived_email")) WHERE (("email" IS NULL) AND ("derived_email" IS NOT NULL));
+
+
+
+CREATE INDEX "idx_profile_invites_name_trgm" ON "public"."profile_invites" USING "gin" (((("lower"("first_name") || ' '::"text") || "lower"("last_name"))) "public"."gin_trgm_ops") WHERE ("email" IS NULL);
+
+
+
+CREATE INDEX "idx_profile_invites_pending_dob" ON "public"."profile_invites" USING "btree" ("company_id", "birth_date_hash") WHERE ("email" IS NULL);
 
 
 
@@ -1532,6 +1830,14 @@ CREATE INDEX "idx_tbi_loan_apps_order" ON "public"."tbi_loan_applications" USING
 
 
 CREATE INDEX "idx_tbi_loan_apps_profile" ON "public"."tbi_loan_applications" USING "btree" ("profile_id");
+
+
+
+CREATE UNIQUE INDEX "profile_invites_email_unique" ON "public"."profile_invites" USING "btree" ("lower"("email")) WHERE ("email" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "profile_invites_source_unique" ON "public"."profile_invites" USING "btree" ("company_id", "source", "source_ref_id") WHERE ("source_ref_id" IS NOT NULL);
 
 
 
@@ -1595,6 +1901,11 @@ ALTER TABLE ONLY "public"."bike_orders"
 
 
 ALTER TABLE ONLY "public"."bike_orders"
+    ADD CONSTRAINT "bike_orders_bike_id_fkey" FOREIGN KEY ("bike_id") REFERENCES "public"."bikes"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."bike_orders"
     ADD CONSTRAINT "bike_orders_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."profiles"("user_id") ON DELETE CASCADE;
 
 
@@ -1621,6 +1932,11 @@ ALTER TABLE ONLY "public"."contracts"
 
 ALTER TABLE ONLY "public"."employee_pii"
     ADD CONSTRAINT "employee_pii_company_id_fkey" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id");
+
+
+
+ALTER TABLE ONLY "public"."employee_pii"
+    ADD CONSTRAINT "employee_pii_profile_invite_id_fkey" FOREIGN KEY ("profile_invite_id") REFERENCES "public"."profile_invites"("id") ON DELETE SET NULL;
 
 
 
@@ -1724,6 +2040,10 @@ CREATE POLICY "HR can update profile invites" ON "public"."profile_invites" FOR 
 
 
 CREATE POLICY "HR can view profile invites" ON "public"."profile_invites" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+
+
+
+CREATE POLICY "HR view pending PII own company" ON "public"."employee_pii" FOR SELECT TO "authenticated" USING ((("user_id" IS NULL) AND ("public"."get_my_role"() = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = "public"."auth_company_id"())));
 
 
 
@@ -1984,6 +2304,18 @@ GRANT ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") TO "serv
 GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "anon";
 GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") TO "service_role";
 
 
 

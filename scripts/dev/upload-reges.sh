@@ -4,7 +4,13 @@
 #
 # Usage:
 #   ./scripts/dev/upload-reges.sh /Users/machita/Downloads/raport.txt
-#   ./scripts/dev/upload-reges.sh raport.txt | jq .       # pretty-print
+#   ./scripts/dev/upload-reges.sh raport.json | jq .      # pretty-print
+#
+# Accepts .json or .txt (REGES sometimes exports JSON with a .txt suffix —
+# the function sniffs by filename, so both work). Anything else is rejected.
+#
+# Sent as multipart/form-data (real HR UI path) so the function's filename-
+# based JSON-vs-CSV dispatch is exercised end-to-end.
 #
 # Pre-reqs:
 #   supabase start && supabase db reset
@@ -17,8 +23,16 @@
 
 set -euo pipefail
 
-FILE="${1:?usage: upload-reges.sh <path/to/raport.txt>}"
+FILE="${1:?usage: upload-reges.sh <path/to/raport.json or .txt>}"
 [ -f "$FILE" ] || { echo "✗ file not found: $FILE" >&2; exit 1; }
+
+case "$(echo "$FILE" | tr '[:upper:]' '[:lower:]')" in
+  *.json|*.txt) ;;
+  *)
+    echo "✗ unsupported extension: $FILE (expected .json or .txt)" >&2
+    exit 1
+    ;;
+esac
 
 if ! supabase status -o env > /dev/null 2>&1; then
   echo "✗ Supabase not running. Run: supabase start && supabase db reset" >&2
@@ -50,6 +64,5 @@ echo >&2
 
 curl -sS -X POST "$API_URL/functions/v1/bulk-create" \
   -H "Authorization: Bearer $JWT" \
-  -H "Content-Type: application/json" \
-  --data-binary "@$FILE"
+  -F "file=@${FILE}"
 echo

@@ -105,7 +105,8 @@ Deno.serve(async (req: Request) => {
 })
 
 // Resolve the upload payload + kind. Supports:
-//   - multipart/form-data with a single .csv or .json file
+//   - multipart/form-data with a single .csv, .json, or .txt file
+//     (.txt is treated as JSON because REGES exports may use that extension)
 //   - text/csv raw body
 //   - application/json raw body
 async function readPayload(req: Request): Promise<{ payload: string | unknown; kind: "csv" | "json" }> {
@@ -117,14 +118,18 @@ async function readPayload(req: Request): Promise<{ payload: string | unknown; k
     const { files } = await parseMultipart(req)
     const file = files[0]
     const fname = (file.filename || "").toLowerCase()
-    if (fname.endsWith(".json")) {
+    // REGES (Romanian gov platform) sometimes exports JSON with a .txt
+    // extension, so treat .txt the same as .json. If the body isn't valid
+    // JSON we reject — .txt is reserved for REGES payloads here.
+    // To revert: drop the `|| fname.endsWith(".txt")` clause.
+    if (fname.endsWith(".json") || fname.endsWith(".txt")) {
       try {
         return { payload: JSON.parse(file.content), kind: "json" }
       } catch {
         throw badRequest(Errors.INVALID_REGES_FORMAT)
       }
     }
-    // Default to CSV for any other extension (.csv, .txt, no extension).
+    // Default to CSV for any other extension (.csv, no extension).
     return { payload: file.content, kind: "csv" }
   }
 

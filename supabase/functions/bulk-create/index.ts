@@ -58,7 +58,7 @@ Deno.serve(async (req: Request) => {
 
     if ((path === "/bulk-create" || path === "/") && method === "POST") {
       const db = makeRestClient(SUPABASE_URL, SERVICE_KEY)
-      const { payload, kind } = await readPayload(req)
+      const { payload, kind } = await readPayload(req, origin)
 
       if (kind === "csv") {
         const results = await ingestCsv(db, companyId, payload as string)
@@ -67,12 +67,15 @@ Deno.serve(async (req: Request) => {
 
       const records = payload as unknown
       if (!Array.isArray(records)) {
+        console.error(`[bulk-create] reject=not_array typeof=${typeof records} isNull=${records === null}`)
         return badRequest(Errors.INVALID_REGES_FORMAT, undefined, origin)
       }
 
       // Precondition for REGES branch: company must have email_domain set.
-      // This is the only branch that needs it, so we check it here (close to
-      // the policy) rather than inside the helper.
+      // Schema-level NOT NULL + CHECK constraint (see migration
+      // 20260601000001_companies_email_domain_required.sql) makes this
+      // unreachable in practice — kept as defense-in-depth in case the
+      // constraint is ever relaxed.
       const company = await db.getOne<{
         id: string; email_domain: string | null; email_pattern: EmailPatternKind | null
       }>(
@@ -96,10 +99,12 @@ Deno.serve(async (req: Request) => {
 
     return notFound(path, origin)
   } catch (err) {
-    // Some helpers (requireRole) throw a pre-built Response on policy
-    // failures; convert those into return values. Anything else is a real
-    // bug — let it propagate to a 500.
+    // Some helpers (requireRole, readPayload) throw a pre-built Response on
+    // policy / validation failures; those carry the user-facing error code
+    // already. Anything else is a real bug — log it (server-side only, no
+    // leak to client) and let it propagate to a 500.
     if (err instanceof Response) return err
+    console.error("[bulk-create] unhandled_error:", err instanceof Error ? err.stack ?? err.message : String(err))
     throw err
   }
 })
@@ -109,15 +114,30 @@ Deno.serve(async (req: Request) => {
 //     (.txt is treated as JSON because REGES exports may use that extension)
 //   - text/csv raw body
 //   - application/json raw body
-async function readPayload(req: Request): Promise<{ payload: string | unknown; kind: "csv" | "json" }> {
+//
+// `origin` is threaded through so the badRequest Response we throw carries
+// proper CORS headers — otherwise the browser blocks the response body and
+// the frontend can't read the error code.
+async function readPayload(
+  req: Request,
+  origin: string,
+): Promise<{ payload: string | unknown; kind: "csv" | "json" }> {
   const ct = req.headers.get("content-type") || ""
+  const cl = req.headers.get("content-length") || "?"
+  // Diagnostic log — server-side only, no payload contents, just classifiers.
+  console.info(`[bulk-create] readPayload ct="${ct}" content_length=${cl}`)
 
   if (ct.startsWith("multipart/form-data")) {
     const boundary = getBoundary(ct)
-    if (!boundary) throw badRequest(Errors.MISSING_BOUNDARY)
+    if (!boundary) {
+      console.error(`[bulk-create] readPayload reject=missing_boundary ct="${ct}"`)
+      throw badRequest(Errors.MISSING_BOUNDARY, undefined, origin)
+    }
     const { files } = await parseMultipart(req)
     const file = files[0]
-    const fname = (file.filename || "").toLowerCase()
+    const fname = (file?.filename || "").toLowerCase()
+    const fsize = file?.content?.length ?? 0
+    console.info(`[bulk-create] readPayload branch=multipart files=${files.length} filename="${fname}" file_bytes=${fsize}`)
     // REGES (Romanian gov platform) sometimes exports JSON with a .txt
     // extension, so treat .txt the same as .json. If the body isn't valid
     // JSON we reject — .txt is reserved for REGES payloads here.
@@ -125,8 +145,9 @@ async function readPayload(req: Request): Promise<{ payload: string | unknown; k
     if (fname.endsWith(".json") || fname.endsWith(".txt")) {
       try {
         return { payload: JSON.parse(file.content), kind: "json" }
-      } catch {
-        throw badRequest(Errors.INVALID_REGES_FORMAT)
+      } catch (e) {
+        console.error(`[bulk-create] readPayload reject=multipart_json_parse_failed filename="${fname}" reason="${e instanceof Error ? e.message : String(e)}"`)
+        throw badRequest(Errors.INVALID_REGES_FORMAT, undefined, origin)
       }
     }
     // Default to CSV for any other extension (.csv, no extension).
@@ -135,15 +156,21 @@ async function readPayload(req: Request): Promise<{ payload: string | unknown; k
 
   if (ct.includes("application/json")) {
     const text = await req.text()
+    console.info(`[bulk-create] readPayload branch=application/json body_bytes=${text.length}`)
     try {
       return { payload: JSON.parse(text), kind: "json" }
-    } catch {
-      throw badRequest(Errors.INVALID_REGES_FORMAT)
+    } catch (e) {
+      console.error(`[bulk-create] readPayload reject=json_body_parse_failed body_bytes=${text.length} reason="${e instanceof Error ? e.message : String(e)}"`)
+      throw badRequest(Errors.INVALID_REGES_FORMAT, undefined, origin)
     }
   }
 
   // Plain text body → CSV (covers text/csv and unspecified content-type).
   const text = await req.text()
-  if (!text.trim()) throw badRequest(Errors.EMPTY_CSV)
+  console.info(`[bulk-create] readPayload branch=raw_text ct="${ct}" body_bytes=${text.length}`)
+  if (!text.trim()) {
+    console.error(`[bulk-create] readPayload reject=empty_csv ct="${ct}"`)
+    throw badRequest(Errors.EMPTY_CSV, undefined, origin)
+  }
   return { payload: text, kind: "csv" }
 }

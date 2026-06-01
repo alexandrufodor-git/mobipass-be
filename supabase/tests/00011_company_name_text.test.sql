@@ -14,15 +14,15 @@ SELECT plan(3);
 
 -- T01: arbitrary name works
 SELECT lives_ok(
-  $$INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-    VALUES ('BrandNewCo 2026', 72.00, 36, 'RON')$$,
+  $$INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
+    VALUES ('BrandNewCo 2026', 72.00, 36, 'RON', 'brandnewco-2026.test')$$,
   'T01: arbitrary company name accepted'
 );
 
 -- T02: duplicate rejected
 SELECT throws_ok(
-  $$INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-    VALUES ('BrandNewCo 2026', 50.00, 24, 'EUR')$$,
+  $$INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
+    VALUES ('BrandNewCo 2026', 50.00, 24, 'EUR', 'brandnewco-2026-dup.test')$$,
   '23505',
   NULL,
   'T02: duplicate company name violates UNIQUE'

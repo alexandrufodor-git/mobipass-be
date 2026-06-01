@@ -23,8 +23,8 @@ DECLARE
   v_uid UUID := gen_random_uuid();
   v_bb  UUID;
 BEGIN
-  INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('contract-co-' || gen_random_uuid()::text, 100.00, 12, 'EUR')
+  INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
+  VALUES ('contract-co-' || gen_random_uuid()::text, 100.00, 12, 'EUR', 'contract-' || gen_random_uuid()::text || '.test')
   RETURNING id INTO v_co;
 
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password,

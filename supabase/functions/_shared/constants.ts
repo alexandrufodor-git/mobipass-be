@@ -114,7 +114,16 @@ export const Errors = {
   CHECK_DETAILS: { error: "check_details" },
 } as const
 
+// Server-side log helper. Logs only the short error code (no PII, no request body,
+// no stack traces) so logs are safe to keep but still tell you which branch fired.
+// The client response body is unchanged — same `{ error, reason? }` shape.
+function logError(status: number, code: string, reason?: string): void {
+  const tag = reason ? `${code} (${reason})` : code
+  console.error(`[${status}] ${tag}`)
+}
+
 export function forbidden(error = Errors.FORBIDDEN, origin?: string): Response {
+  logError(403, error.error, error.reason)
   return new Response(
     JSON.stringify({ error: error.error, reason: error.reason }),
     { status: 403, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
@@ -122,6 +131,7 @@ export function forbidden(error = Errors.FORBIDDEN, origin?: string): Response {
 }
 
 export function invalidJwt(error = Errors.INVALID_JWT, origin?: string): Response {
+  logError(401, error.error)
   return new Response(
     JSON.stringify({ error: error.error }),
     { status: 401, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
@@ -129,6 +139,7 @@ export function invalidJwt(error = Errors.INVALID_JWT, origin?: string): Respons
 }
 
 export function roleLookupFailed(error = Errors.ROLE_LOOKUP_FAILED, origin?: string): Response {
+  logError(500, error.error)
   return new Response(
     JSON.stringify({ error: error.error }),
     { status: 500, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
@@ -136,6 +147,7 @@ export function roleLookupFailed(error = Errors.ROLE_LOOKUP_FAILED, origin?: str
 }
 
 export function badRequest(error: { error: string }, extra?: Record<string, unknown>, origin?: string): Response {
+  logError(400, error.error, (error as { reason?: string }).reason)
   return new Response(
     JSON.stringify({ ...error, ...extra }),
     { status: 400, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
@@ -143,6 +155,7 @@ export function badRequest(error: { error: string }, extra?: Record<string, unkn
 }
 
 export function notFound(path?: string, origin?: string): Response {
+  logError(404, Errors.NOT_FOUND.error, path)
   return new Response(
     JSON.stringify({ ...Errors.NOT_FOUND, ...(path && { path }) }),
     { status: 404, headers: { "content-type": "application/json", ...getCorsHeaders(origin) } }
@@ -150,6 +163,11 @@ export function notFound(path?: string, origin?: string): Response {
 }
 
 export function json(obj: unknown, status = 200, origin?: string): Response {
+  if (status >= 400) {
+    const code = (obj as { error?: string } | null)?.error ?? "unknown_error"
+    const reason = (obj as { reason?: string } | null)?.reason
+    logError(status, code, reason)
+  }
   return new Response(JSON.stringify(obj), {
     status,
     headers: { "content-type": "application/json", ...getCorsHeaders(origin) },

@@ -4,8 +4,9 @@ SET search_path TO extensions, public;
 -- pgTAP: REGES employee bridge
 -- Tests:
 --   Schema:
---     T01: companies.email_domain column exists, nullable
---     T02: companies_email_domain_unique partial unique blocks duplicate
+--     T01: companies.email_domain column exists, NOT NULL (tightened in
+--          migration 20260601000001_companies_email_domain_required.sql)
+--     T02: companies_email_domain_unique blocks duplicate
 --     T03: companies.email_pattern column exists, type email_pattern_kind
 --     T04: profile_invites.email is nullable
 --     T05: profile_invites_email_unique partial unique works
@@ -40,6 +41,14 @@ SET search_path TO extensions, public;
 --     T27: claimed invite row → invite_status='skipped_claimed'
 --     T28: radiat false→true on claimed row fires reges_terminated notification
 --     T29: bad record raises (transactional rollback contract)
+--   Link-existing-profile (migration 20260601000002):
+--     T30: REGES record whose derived_email matches an existing profile
+--          auto-links: employee_pii.user_id = matched user, profile_invite
+--          status='active' + user_id set, status code = 'created_linked'
+--     T31: REGES upload where the matched user already has a PII row
+--          (HR who set their own PII first) MERGES into that row instead
+--          of inserting a second (would violate employee_pii_user_unique);
+--          status code = 'merged', existing non-null values preserved.
 -- ============================================================
 
 BEGIN;
@@ -93,23 +102,25 @@ BEGIN
 END;
 $$;
 
-SELECT plan(31);
+SELECT plan(35);
 
 -- ============================================================
 -- Schema assertions
 -- ============================================================
 
--- ── T01: companies.email_domain exists, nullable ────────────────────────────
-SELECT col_is_null(
+-- ── T01: companies.email_domain is NOT NULL ─────────────────────────────────
+SELECT col_not_null(
   'public', 'companies', 'email_domain',
-  'T01: companies.email_domain is nullable'
+  'T01: companies.email_domain is NOT NULL'
 );
 
--- ── T02: partial unique on lower(email_domain) ──────────────────────────────
+-- ── T02: unique on lower(email_domain) ──────────────────────────────────────
+-- The companies_email_domain_format CHECK enforces lowercase storage, so the
+-- previous mixed-case "case-insensitive" probe was unreachable. We still
+-- verify the unique index by inserting the same lowercase domain twice.
 DO $$
 DECLARE
   v_co_x uuid;
-  v_co_y uuid;
 BEGIN
   INSERT INTO public.companies (
     name, monthly_benefit_subsidy, contract_months, currency, email_domain
@@ -121,10 +132,10 @@ $$;
 
 SELECT throws_ok(
   $$INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
-    VALUES ('t02-y-dup', 1, 12, 'RON', 'DUP-DOMAIN-T02.example')$$,
+    VALUES ('t02-y-dup', 1, 12, 'RON', 'dup-domain-t02.example')$$,
   '23505',
   NULL,
-  'T02: companies_email_domain_unique blocks duplicate domain (case-insensitive)'
+  'T02: companies_email_domain_unique blocks duplicate domain'
 );
 
 -- ── T03: companies.email_pattern email_pattern_kind ─────────────────────────
@@ -738,6 +749,177 @@ SELECT throws_ok(
   '23502',  -- not_null_violation
   NULL,
   'T29: ingest_reges_batch raises NOT NULL violation on missing required field (transactional contract)'
+);
+
+-- ── T30: REGES record auto-links to a pre-registered profile ────────────────
+-- Setup: existing auth.user + profile + (no pii row) at co_a, email matches
+-- the REGES record's derived_email. Expected: ingest_reges_batch writes
+-- employee_pii.user_id = matched user, profile_invites.user_id set with
+-- status='active', and per-record status code is 'created_linked'.
+DO $$
+DECLARE
+  v_co_a uuid := current_setting('test.co_a_id')::uuid;
+  v_user uuid := gen_random_uuid();
+  v_email text := 'meler.angura.' || substr(gen_random_uuid()::text, 1, 8) || '@t30.local';
+  v_result jsonb;
+  v_pii_user uuid;
+  v_invite_user uuid;
+  v_invite_status text;
+  v_pii_status text;
+BEGIN
+  -- Insert auth.users directly. encrypted_password='' / email_confirmed_at
+  -- omitted keeps the on_auth_user_created trigger silent (it only fires when
+  -- both are set), so we can wire up the profile without an invite row.
+  INSERT INTO auth.users (
+    id, instance_id, aud, role, email, encrypted_password,
+    created_at, updated_at,
+    confirmation_token, email_change, email_change_token_new, recovery_token
+  ) VALUES (
+    v_user, '00000000-0000-0000-0000-000000000000'::uuid,
+    'authenticated', 'authenticated', v_email, '',
+    now(), now(), '', '', '', ''
+  );
+
+  INSERT INTO public.profiles (user_id, email, company_id, status, first_name, last_name)
+  VALUES (v_user, v_email, v_co_a, 'active', 'Meler', 'Angura');
+
+  INSERT INTO public.user_roles (user_id, role) VALUES (v_user, 'hr'::public.user_role);
+
+  v_result := public.ingest_reges_batch(
+    v_co_a,
+    jsonb_build_array(jsonb_build_object(
+      'source_ref_id',           't30-ref',
+      'first_name',              'Meler',
+      'last_name',               'Angura',
+      'birth_date_hash',         'h-t30',
+      'derived_email',           v_email,
+      'radiat',                  false,
+      'national_id_encrypted',   'enc-cnp-t30',
+      'home_address_encrypted',  'enc-addr-t30',
+      'date_of_birth_encrypted', 'enc-dob-t30'
+    ))
+  );
+
+  -- The RPC returns a JSON array with one element per record.
+  v_invite_status := v_result->0->>'invite_status';
+  v_pii_status    := v_result->0->>'status';
+
+  SELECT user_id INTO v_pii_user
+    FROM public.employee_pii
+   WHERE company_id = v_co_a AND source_ref_id = 't30-ref';
+
+  SELECT user_id INTO v_invite_user
+    FROM public.profile_invites
+   WHERE company_id = v_co_a AND source = 'reges' AND source_ref_id = 't30-ref';
+
+  PERFORM set_config('test.t30_pii_user',       v_pii_user::text,       false);
+  PERFORM set_config('test.t30_invite_user',    v_invite_user::text,    false);
+  PERFORM set_config('test.t30_invite_status',  v_invite_status,        false);
+  PERFORM set_config('test.t30_pii_status',     v_pii_status,           false);
+  PERFORM set_config('test.t30_user',           v_user::text,           false);
+END;
+$$;
+
+SELECT is(
+  current_setting('test.t30_pii_status'), 'created_linked',
+  'T30a: REGES PII status is created_linked when an existing profile matches derived_email'
+);
+
+SELECT is(
+  current_setting('test.t30_pii_user'), current_setting('test.t30_user'),
+  'T30b: employee_pii.user_id was auto-linked to the pre-registered user'
+);
+
+-- ── T31: existing PII row for matched user → MERGE instead of insert ───────
+-- Setup: a fresh user at co_a who already has a manually-entered PII row
+-- (e.g. via update-employee-pii). REGES then arrives with the same
+-- derived_email. Expected: the existing PII row is updated in place
+-- (source_ref_id stamped, NULL fields filled in, non-null fields preserved),
+-- status='merged'. No second employee_pii row is created.
+DO $$
+DECLARE
+  v_co_a uuid := current_setting('test.co_a_id')::uuid;
+  v_user uuid := gen_random_uuid();
+  v_email text := 'merge.user.' || substr(gen_random_uuid()::text, 1, 8) || '@t31.local';
+  v_existing_pii uuid;
+  v_after_pii uuid;
+  v_after_addr text;
+  v_after_source text;
+  v_count int;
+  v_result jsonb;
+  v_pii_status text;
+BEGIN
+  INSERT INTO auth.users (
+    id, instance_id, aud, role, email, encrypted_password,
+    created_at, updated_at,
+    confirmation_token, email_change, email_change_token_new, recovery_token
+  ) VALUES (
+    v_user, '00000000-0000-0000-0000-000000000000'::uuid,
+    'authenticated', 'authenticated', v_email, '',
+    now(), now(), '', '', '', ''
+  );
+
+  INSERT INTO public.profiles (user_id, email, company_id, status, first_name, last_name)
+  VALUES (v_user, v_email, v_co_a, 'active', 'Merge', 'User');
+
+  INSERT INTO public.user_roles (user_id, role) VALUES (v_user, 'employee'::public.user_role);
+
+  -- Existing PII row written by something other than REGES (simulates an
+  -- HR who entered their own address before the REGES upload).
+  INSERT INTO public.employee_pii (
+    user_id, company_id, source, home_address_encrypted
+  ) VALUES (
+    v_user, v_co_a, 'manual', 'user-typed-address'
+  ) RETURNING id INTO v_existing_pii;
+
+  v_result := public.ingest_reges_batch(
+    v_co_a,
+    jsonb_build_array(jsonb_build_object(
+      'source_ref_id',           't31-ref',
+      'first_name',              'Merge',
+      'last_name',               'User',
+      'birth_date_hash',         'h-t31',
+      'derived_email',           v_email,
+      'radiat',                  false,
+      'national_id_encrypted',   'enc-cnp-t31',
+      'home_address_encrypted',  'reges-supplied-address',
+      'date_of_birth_encrypted', 'enc-dob-t31'
+    ))
+  );
+
+  v_pii_status := v_result->0->>'status';
+
+  -- After merge: still exactly one PII row for this user.
+  SELECT count(*) INTO v_count
+    FROM public.employee_pii
+   WHERE user_id = v_user;
+
+  SELECT id, home_address_encrypted, source
+    INTO v_after_pii, v_after_addr, v_after_source
+    FROM public.employee_pii
+   WHERE user_id = v_user;
+
+  PERFORM set_config('test.t31_pii_status',   v_pii_status,             false);
+  PERFORM set_config('test.t31_pii_count',    v_count::text,            false);
+  PERFORM set_config('test.t31_same_row',
+    CASE WHEN v_after_pii = v_existing_pii THEN 'yes' ELSE 'no' END,
+    false);
+  PERFORM set_config('test.t31_addr',         v_after_addr,             false);
+  PERFORM set_config('test.t31_source',       v_after_source,           false);
+END;
+$$;
+
+SELECT is(
+  current_setting('test.t31_pii_status'), 'merged',
+  'T31a: REGES upload onto a user with existing PII returns status=merged'
+);
+
+-- The merge preserved the user-entered address (existing non-null wins over
+-- REGES-supplied value); stamped source='reges' + source_ref_id; produced
+-- exactly one row (same id as the pre-existing one).
+SELECT is(
+  current_setting('test.t31_pii_count'), '1',
+  'T31b: merge keeps exactly one PII row for the matched user (no duplicate)'
 );
 
 SELECT * FROM finish();

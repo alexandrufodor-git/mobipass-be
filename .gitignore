@@ -11,3 +11,8 @@
 .env.local
 .env.*.local
 .supabase-functions-serve.*
+
+# Local configs for scripts/dev/create-company.sh (may contain service role
+# keys). The .example template is still tracked because its filename ends in
+# .example, not .env.
+scripts/dev/*.env

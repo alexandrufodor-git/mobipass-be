@@ -41,8 +41,24 @@ export interface RegesRecord {
   info:              RegesInfo
 }
 
+// PII outcome codes returned by ingest_reges_batch (per record):
+//   created          — new staged row (user_id=NULL). Trigger backfills on
+//                      first OTP signup.
+//   created_linked   — new row written with user_id of an already-registered
+//                      profile that matched derived_email (no staged state).
+//   merged           — matched user already had a PII row (e.g. HR who
+//                      filled their own PII first); REGES fields merged in
+//                      without overwriting non-null user-entered values.
+//   updated          — re-upload of a previously-imported REGES row, still
+//                      unclaimed.
+//   skipped_claimed  — re-upload of a previously-imported REGES row that has
+//                      since been claimed by a registered user; we don't
+//                      overwrite live data.
+//   failed           — per-record shape/validation error (set by edge code).
 export type IngestStatus =
   | "created"
+  | "created_linked"
+  | "merged"
   | "updated"
   | "skipped_claimed"
   | "failed"
@@ -53,6 +69,7 @@ export interface IngestResult {
   invite_id?:      string
   employee_pii_id?: string
   invite_status?:  string
+  matched_user?:   string | null
   error?:          string
 }
 
@@ -176,6 +193,7 @@ export async function ingestRegesArray(
     invite_id:       string
     employee_pii_id: string
     invite_status:   string
+    matched_user:    string | null
   }>>("ingest_reges_batch", {
     p_company_id: company.id,
     p_records:    batch,
@@ -187,6 +205,7 @@ export async function ingestRegesArray(
     invite_id:       r.invite_id,
     employee_pii_id: r.employee_pii_id,
     invite_status:   r.invite_status,
+    matched_user:    r.matched_user,
   }))
 
   return [...ok, ...failed]

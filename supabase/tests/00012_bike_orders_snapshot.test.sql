@@ -27,8 +27,8 @@ DECLARE
   v_bb  UUID;
   v_bid UUID;
 BEGIN
-  INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('snapshot-co-' || gen_random_uuid()::text, 100.00, 12, 'EUR')
+  INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
+  VALUES ('snapshot-co-' || gen_random_uuid()::text, 100.00, 12, 'EUR', 'snapshot-' || gen_random_uuid()::text || '.test')
   RETURNING id INTO v_co;
 
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password,

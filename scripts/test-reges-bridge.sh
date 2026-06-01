@@ -92,7 +92,7 @@ INSERT INTO public.companies
   (id, name, monthly_benefit_subsidy, contract_months, currency, email_domain, email_pattern)
 VALUES
   ('$CO_A_ID', 'reges-test-a', 80.0, 36, 'RON', '$DOMAIN_A', 'first_last'::public.email_pattern_kind),
-  ('$CO_B_ID', 'reges-test-b', 80.0, 36, 'RON', NULL,        NULL);
+  ('$CO_B_ID', 'reges-test-b', 80.0, 36, 'RON', '$DOMAIN_B', NULL);
 
 INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token)
 VALUES
@@ -191,14 +191,10 @@ STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/functions/v1/b
   -d "$REGES_ONE_RECORD")
 check "1.5 employee JWT → 403" "$([ "$STATUS" = "403" ] && echo true || echo false)"
 
-# 1.6 HR for co_b (no email_domain configured) → 400
-RESP=$(curl -s -X POST "$API_URL/functions/v1/bulk-create" \
-  -H "Authorization: Bearer $HR_B_JWT" \
-  -H "Content-Type: application/json" \
-  -d "$REGES_ONE_RECORD")
-HAS_DOMAIN_ERR=$(echo "$RESP" | grep -c 'company_domain_not_configured' || true)
-check "1.6 missing email_domain → company_domain_not_configured" \
-  "$([ "$HAS_DOMAIN_ERR" -ge "1" ] && echo true || echo false)"
+# 1.6 was: HR for a company with NULL email_domain → company_domain_not_configured.
+# Dropped: companies.email_domain is now NOT NULL + CHECK-validated at the
+# schema level (migration 20260601000001), so the negative case is no longer
+# constructible. The edge-function runtime check remains as defense-in-depth.
 
 # 1.7 malformed JSON (non-array)
 RESP=$(curl -s -X POST "$API_URL/functions/v1/bulk-create" \

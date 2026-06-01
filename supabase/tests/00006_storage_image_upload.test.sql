@@ -176,8 +176,8 @@ DECLARE
   v_user_id uuid := gen_random_uuid();
   v_co_id   uuid;
 BEGIN
-  INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency)
-  VALUES ('storage-co-' || gen_random_uuid()::text, 100.00, 12, 'EUR') RETURNING id INTO v_co_id;
+  INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain)
+  VALUES ('storage-co-' || gen_random_uuid()::text, 100.00, 12, 'EUR', 'storage-' || gen_random_uuid()::text || '.test') RETURNING id INTO v_co_id;
 
   INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, confirmation_token, email_change, email_change_token_new, recovery_token)
   VALUES (v_user_id, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'trigger-test@test.local', '', now(), now(), '', '', '', '');

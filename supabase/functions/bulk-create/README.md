@@ -54,45 +54,121 @@ alice.williams@example.com,Alice,Williams,HR,5 years,1659398400000,HR Director
 
 ## Response Format
 
+Both the CSV and the REGES JSON branches return the **same per-record
+shape**. Each `results[i]` mirrors a row of the
+`profile_invites_with_details` view (so the FE can reuse its dashboard row
+type), plus an outcome envelope (`status`, `invited`, optional `error`).
+
+`email` and `derived_email` are **both nullable**:
+
+- CSV invite → `email` is set to the value from the file, `derived_email` is `null`.
+- REGES invite → `derived_email` is set when the company has an `email_pattern`; `email` stays `null` until the employee claims the invite via `/register`.
+
+`status` values:
+
+| value | when |
+|---|---|
+| `created` | new invite row written |
+| `created_linked` | REGES — invite linked to an already-registered profile via `derived_email` |
+| `merged` | REGES — PII merged into an existing `employee_pii` row |
+| `updated` | re-upload of an existing unclaimed invite |
+| `skipped_claimed` | re-upload of an invite already claimed by an employee (no overwrite) |
+| `already_exists` | CSV duplicate email |
+| `invalid_email` | CSV row with malformed email |
+| `missing_first_name` / `missing_last_name` | CSV row missing required field |
+| `failed` | REGES per-record validation error (see `error`) |
+
 ```json
 {
   "created": 4,
   "results": [
     {
-      "email": "john.doe@example.com",
-      "invited": true,
-      "body": {
-        "id": "123e4567-e89b-12d3-a456-426614174000",
-        "email": "john.doe@example.com",
-        "first_name": "John",
-        "last_name": "Doe",
-        "department": "Engineering",
-        "experience": "3 years",
-        "hire_date": 1672531200000,
-        "description": "Senior Software Engineer",
-        "company_id": "abc12345-e89b-12d3-a456-426614174000",
-        "status": "inactive",
-        "created_at": "2024-02-01T12:00:00Z"
-      }
+      "invite_id":          "123e4567-e89b-12d3-a456-426614174000",
+      "email":              "john.doe@example.com",
+      "derived_email":      null,
+      "first_name":         "John",
+      "last_name":          "Doe",
+      "description":        "Senior Software Engineer",
+      "department":         "Engineering",
+      "hire_date":          1672531200000,
+      "source":             "manual",
+      "radiat":             false,
+      "invite_status":      "inactive",
+      "invited_at":         "2024-02-01T12:00:00Z",
+      "company_id":         "abc12345-e89b-12d3-a456-426614174000",
+      "company_name":       "Acme",
+      "logo_image_path":    null,
+      "user_id":            null,
+      "profile_status":     null,
+      "registered_at":      null,
+      "profile_image_path": null,
+      "bike_benefit_id":    null,
+      "benefit_status":     null,
+      "contract_status":    null,
+      "last_modified_at":   "2024-02-01T12:00:00Z",
+      "bike_id":            null,
+      "order_id":           null,
+
+      "status":             "created",
+      "invited":            true
     },
     {
-      "email": "existing@example.com",
-      "invited": false,
-      "status": "already_exists"
+      "invite_id":     "9aa12345-...",
+      "email":         "existing@example.com",
+      "derived_email": null,
+      "first_name":    "Jane",
+      "last_name":     "Smith",
+      "status":        "already_exists",
+      "invited":       false
     },
     {
-      "email": "invalid-email",
-      "invited": false,
-      "error": "invalid_email"
-    },
-    {
-      "email": "missing.name@example.com",
-      "invited": false,
-      "error": "missing_first_name"
+      "invite_id":     "",
+      "email":         "invalid-email",
+      "derived_email": null,
+      "first_name":    null,
+      "last_name":     null,
+      "status":        "invalid_email",
+      "invited":       false,
+      "error":         "invalid_email"
     }
   ]
 }
 ```
+
+> Fields not shown in the second/third example are still present (set to
+> `null`); only the relevant ones are listed for brevity.
+
+## TBD — REGES `radiat` cascade on claimed invites
+
+Today, when REGES says an already-onboarded employee left the company
+(`radiat: false → true` on a claimed invite), `ingest_reges_batch` only:
+
+- flips `profile_invites.radiat` to `true`
+- emits `company_notifications` (`event_type='reges_terminated'`)
+
+It does **not** touch `bike_benefits` (`benefit_status` / `contract_status`
+stay in whatever state they had), so the HR dashboard can show
+`benefit_status='active'` while `radiat=true`. `/register` is already
+defensive (`403 invite_inactive` if `radiat=true`).
+
+**Why we're not auto-terminating yet:**
+the subsidy math is per-company. Hard-terminating bricks the employee's
+in-flight bike benefit and erases their progress; in some cases the
+employee actually *moved* (acquired by another company, transferred,
+went freelance) and we'd want to **carry their data over to the new
+company / a personal-login account before terminating the source row**.
+
+Plan once that path exists:
+
+1. New endpoint to migrate `{profile, employee_pii, bike_benefit, contract,
+   bike_order, tbi_loan_application}` from company A → company B (or to a
+   "personal" company-less profile).
+2. Only after a successful migration (or HR explicit confirmation) does
+   the cascade fire: `bike_benefits.benefit_status='terminated'`,
+   `benefit_terminated_at=now()`, `contract_status='terminated'`,
+   `contract_terminated_at=now()`.
+3. Until then, `radiat` stays advisory — HR makes the call manually
+   from the dashboard banner driven by `reges_terminated` notifications.
 
 ## Example Request (cURL)
 

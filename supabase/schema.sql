@@ -603,6 +603,27 @@ $$;
 ALTER FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."current_user_has_password"() RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM "auth"."users"
+    WHERE "id" = "auth"."uid"()
+      AND "encrypted_password" IS NOT NULL
+      AND length("encrypted_password") > 0
+  );
+$$;
+
+
+ALTER FUNCTION "public"."current_user_has_password"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."current_user_has_password"() IS 'True if the calling user (auth.uid()) has a password set in auth.users. SECURITY DEFINER, self-scoped, returns only a boolean — never exposes the hash. Mobile uses it to skip the optional password-setup screen after Google SSO.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."custom_access_token_hook"("event" "jsonb") RETURNS "jsonb"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -655,6 +676,47 @@ Multi-role aware (an HR user can also be an employee). No device validation - se
 1. RLS policies / edge-function guards based on the role claims
 2. Employee-only actions gate on a DB user_roles row, never on the single user_role claim';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."enforce_email_matches_company_domain"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO ''
+    AS $$
+DECLARE
+  v_company_domain text;
+  v_email_domain   text;
+BEGIN
+  -- REGES-staged invites carry a NULL email until claim time — nothing to check.
+  IF NEW.email IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT lower(c.email_domain)
+    INTO v_company_domain
+    FROM public.companies c
+   WHERE c.id = NEW.company_id;
+
+  -- No company / no domain resolvable yet → let the FK + NOT NULL constraints
+  -- be the ones that complain, not this check.
+  IF v_company_domain IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  v_email_domain := lower(split_part(NEW.email, '@', 2));
+
+  IF v_email_domain IS DISTINCT FROM v_company_domain THEN
+    RAISE EXCEPTION
+      'EMAIL_DOMAIN_MISMATCH: email % (domain %) does not match company % domain %',
+      NEW.email, v_email_domain, NEW.company_id, v_company_domain
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."enforce_email_matches_company_domain"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) RETURNS integer
@@ -3007,7 +3069,7 @@ CREATE UNIQUE INDEX "user_roles_user_role_idx" ON "public"."user_roles" USING "b
 
 
 
-CREATE OR REPLACE VIEW "public"."sync_run_summary" AS
+CREATE OR REPLACE VIEW "public"."sync_run_summary" WITH ("security_invoker"='on') AS
  SELECT "r"."id",
     "r"."dealer_id",
     "r"."mode",
@@ -3036,6 +3098,14 @@ CREATE OR REPLACE VIEW "public"."sync_run_summary" AS
 
 
 CREATE OR REPLACE TRIGGER "set_contracts_updated_at" BEFORE UPDATE ON "public"."contracts" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_profile_invites_email_domain" BEFORE INSERT OR UPDATE OF "email", "company_id" ON "public"."profile_invites" FOR EACH ROW EXECUTE FUNCTION "public"."enforce_email_matches_company_domain"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_profiles_email_domain" BEFORE INSERT OR UPDATE OF "email", "company_id" ON "public"."profiles" FOR EACH ROW EXECUTE FUNCTION "public"."enforce_email_matches_company_domain"();
 
 
 
@@ -3271,19 +3341,21 @@ CREATE POLICY "Enable read access for user own roles" ON "public"."user_roles" F
 
 
 
-CREATE POLICY "HR can assign roles" ON "public"."user_roles" FOR INSERT TO "authenticated" WITH CHECK (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") OR (("auth"."jwt"() ->> 'user_role'::"text") = 'admin'::"text")));
+CREATE POLICY "HR can assign roles" ON "public"."user_roles" FOR INSERT TO "authenticated" WITH CHECK (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND (EXISTS ( SELECT 1
+   FROM "public"."profiles" "p"
+  WHERE (("p"."user_id" = "user_roles"."user_id") AND ("p"."company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id")))))));
 
 
 
-CREATE POLICY "HR can delete profile invites" ON "public"."profile_invites" FOR DELETE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+CREATE POLICY "HR can delete profile invites" ON "public"."profile_invites" FOR DELETE TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") AND ("company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id"))));
 
 
 
-CREATE POLICY "HR can update profile invites" ON "public"."profile_invites" FOR UPDATE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+CREATE POLICY "HR can update profile invites" ON "public"."profile_invites" FOR UPDATE TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") AND ("company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id")))) WITH CHECK (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") AND ("company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id"))));
 
 
 
-CREATE POLICY "HR can view profile invites" ON "public"."profile_invites" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+CREATE POLICY "HR can view profile invites" ON "public"."profile_invites" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") AND ("company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id"))));
 
 
 
@@ -3291,7 +3363,7 @@ CREATE POLICY "HR view pending PII own company" ON "public"."employee_pii" FOR S
 
 
 
-CREATE POLICY "Hr can only add profile invites" ON "public"."profile_invites" FOR INSERT TO "authenticated" WITH CHECK ((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text"));
+CREATE POLICY "Hr can only add profile invites" ON "public"."profile_invites" FOR INSERT TO "authenticated" WITH CHECK (((("auth"."jwt"() ->> 'user_role'::"text") = 'hr'::"text") AND ("company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id"))));
 
 
 
@@ -3314,11 +3386,17 @@ CREATE POLICY "bike_benefits_employee_update" ON "public"."bike_benefits" FOR UP
 
 
 
-CREATE POLICY "bike_benefits_hr_select" ON "public"."bike_benefits" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+CREATE POLICY "bike_benefits_hr_select" ON "public"."bike_benefits" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND (EXISTS ( SELECT 1
+   FROM "public"."profiles" "p"
+  WHERE (("p"."user_id" = "bike_benefits"."user_id") AND ("p"."company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id")))))));
 
 
 
-CREATE POLICY "bike_benefits_hr_update" ON "public"."bike_benefits" FOR UPDATE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+CREATE POLICY "bike_benefits_hr_update" ON "public"."bike_benefits" FOR UPDATE TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND (EXISTS ( SELECT 1
+   FROM "public"."profiles" "p"
+  WHERE (("p"."user_id" = "bike_benefits"."user_id") AND ("p"."company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id"))))))) WITH CHECK (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND (EXISTS ( SELECT 1
+   FROM "public"."profiles" "p"
+  WHERE (("p"."user_id" = "bike_benefits"."user_id") AND ("p"."company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id")))))));
 
 
 
@@ -3344,11 +3422,17 @@ CREATE POLICY "bike_orders_employee_update" ON "public"."bike_orders" FOR UPDATE
 
 
 
-CREATE POLICY "bike_orders_hr_select" ON "public"."bike_orders" FOR SELECT TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+CREATE POLICY "bike_orders_hr_select" ON "public"."bike_orders" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND (EXISTS ( SELECT 1
+   FROM "public"."profiles" "p"
+  WHERE (("p"."user_id" = "bike_orders"."user_id") AND ("p"."company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id")))))));
 
 
 
-CREATE POLICY "bike_orders_hr_update" ON "public"."bike_orders" FOR UPDATE TO "authenticated" USING ((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])));
+CREATE POLICY "bike_orders_hr_update" ON "public"."bike_orders" FOR UPDATE TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND (EXISTS ( SELECT 1
+   FROM "public"."profiles" "p"
+  WHERE (("p"."user_id" = "bike_orders"."user_id") AND ("p"."company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id"))))))) WITH CHECK (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND (EXISTS ( SELECT 1
+   FROM "public"."profiles" "p"
+  WHERE (("p"."user_id" = "bike_orders"."user_id") AND ("p"."company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id")))))));
 
 
 
@@ -3392,9 +3476,11 @@ CREATE POLICY "contracts_employee_select_own" ON "public"."contracts" FOR SELECT
 
 
 
-CREATE POLICY "contracts_hr_admin_select" ON "public"."contracts" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+CREATE POLICY "contracts_hr_admin_select" ON "public"."contracts" FOR SELECT TO "authenticated" USING (((EXISTS ( SELECT 1
    FROM "public"."user_roles" "ur"
-  WHERE (("ur"."user_id" = "auth"."uid"()) AND ("ur"."role" = ANY (ARRAY['hr'::"public"."user_role", 'admin'::"public"."user_role"]))))));
+  WHERE (("ur"."user_id" = "auth"."uid"()) AND ("ur"."role" = ANY (ARRAY['hr'::"public"."user_role", 'admin'::"public"."user_role"]))))) AND (EXISTS ( SELECT 1
+   FROM "public"."profiles" "p"
+  WHERE (("p"."user_id" = "contracts"."user_id") AND ("p"."company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id")))))));
 
 
 
@@ -3795,9 +3881,22 @@ GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_statu
 
 
 
+REVOKE ALL ON FUNCTION "public"."current_user_has_password"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."current_user_has_password"() TO "anon";
+GRANT ALL ON FUNCTION "public"."current_user_has_password"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."current_user_has_password"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") TO "service_role";
 GRANT ALL ON FUNCTION "public"."custom_access_token_hook"("event" "jsonb") TO "supabase_auth_admin";
+
+
+
+GRANT ALL ON FUNCTION "public"."enforce_email_matches_company_domain"() TO "anon";
+GRANT ALL ON FUNCTION "public"."enforce_email_matches_company_domain"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."enforce_email_matches_company_domain"() TO "service_role";
 
 
 

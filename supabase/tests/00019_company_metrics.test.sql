@@ -12,12 +12,15 @@ SET search_path TO extensions, public;
 --   3 profile_invites (2 active, 1 inactive) → total=3, active_accounts=2
 --   e1: profile + employee_pii(5.0) + active+delivered benefit (via replica)
 --   e2: profile + employee_pii(5.0), benefit added LIVE later to test the trigger
+--   e3: profile + a SEARCHING benefit (via replica) — non-active, so total_benefits
+--       (any status) diverges from active_benefits. One benefit per profile.
 -- Company B: created (seed trigger) but empty.
 --
 --  M01 total_accounts=3  M02 active_accounts=2  M03 active_benefits=1
+--  M03b total_benefits=2 (e1 active + e3 searching)
 --  M04 co2_all_time_kg=8.25  M05 invite INSERT live-bumps total→4
---  M06 benefit INSERT live-bumps active_benefits→2  M07 co2 live→16.5
---  M08 company B seeded zero row  M09/M10 RLS own vs other
+--  M06 benefit INSERT live-bumps active_benefits→2  M06b total_benefits→3
+--  M07 co2 live→16.5  M08 company B seeded zero row  M09/M10 RLS own vs other
 -- ============================================================
 
 BEGIN;
@@ -31,6 +34,7 @@ DECLARE
   v_hr    uuid := gen_random_uuid();
   v_e1    uuid := gen_random_uuid();
   v_e2    uuid := gen_random_uuid();
+  v_e3    uuid := gen_random_uuid();
 BEGIN
   INSERT INTO public.companies (name, monthly_benefit_subsidy, contract_months, currency, email_domain, days_in_office, address_lat, address_lon)
   VALUES ('metr-co-a-' || gen_random_uuid()::text, 72.00, 36, 'EUR', v_dom_a, 5, 46.77, 23.59) RETURNING id INTO v_co_a;
@@ -41,13 +45,15 @@ BEGIN
   VALUES
     (v_hr, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'hr@' || v_dom_a, '', now(), now(), '', '', '', ''),
     (v_e1, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'e1@' || v_dom_a, '', now(), now(), '', '', '', ''),
-    (v_e2, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'e2@' || v_dom_a, '', now(), now(), '', '', '', '');
+    (v_e2, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'e2@' || v_dom_a, '', now(), now(), '', '', '', ''),
+    (v_e3, '00000000-0000-0000-0000-000000000000'::uuid, 'authenticated', 'authenticated', 'e3@' || v_dom_a, '', now(), now(), '', '', '', '');
 
   INSERT INTO public.profiles (user_id, email, company_id, status, first_name, last_name)
   VALUES
     (v_hr, 'hr@' || v_dom_a, v_co_a, 'active', 'HR', 'A'),
     (v_e1, 'e1@' || v_dom_a, v_co_a, 'active', 'E1', 'A'),
-    (v_e2, 'e2@' || v_dom_a, v_co_a, 'active', 'E2', 'A');
+    (v_e2, 'e2@' || v_dom_a, v_co_a, 'active', 'E2', 'A'),
+    (v_e3, 'e3@' || v_dom_a, v_co_a, 'active', 'E3', 'A');
 
   INSERT INTO public.user_roles (user_id, role) VALUES (v_hr, 'hr'::public.user_role);
 
@@ -62,9 +68,13 @@ BEGIN
     (v_e2, v_co_a, 5.0, now());
 
   -- e1: active+delivered benefit set exactly via replica (no trigger).
+  -- e3: a non-active (searching) benefit — one benefit per profile — so
+  -- total_benefits (counts any status) diverges from active_benefits.
   SET LOCAL session_replication_role = replica;
   INSERT INTO public.bike_benefits (user_id, step, committed_at, delivered_at, benefit_status)
   VALUES (v_e1, 'sign_contract', now(), now(), 'active'::public.benefit_status);
+  INSERT INTO public.bike_benefits (user_id, step, benefit_status)
+  VALUES (v_e3, 'choose_bike', 'searching'::public.benefit_status);
   SET LOCAL session_replication_role = DEFAULT;
 
   PERFORM set_config('test.hr_id',   v_hr::text,   false);
@@ -75,7 +85,7 @@ BEGIN
 END;
 $$;
 
-SELECT plan(11);
+SELECT plan(13);
 
 -- Compute CO₂ stats (also cascades to metrics CO₂ via the stats trigger) + counts.
 SELECT public.refresh_company_co2_stats();
@@ -87,6 +97,8 @@ SELECT is((SELECT active_accounts FROM public.company_metrics WHERE company_id =
   2, 'M02: active_accounts = 2 active invites');
 SELECT is((SELECT active_benefits FROM public.company_metrics WHERE company_id = current_setting('test.co_a_id')::uuid),
   1, 'M03: active_benefits = 1 (e1)');
+SELECT is((SELECT total_benefits FROM public.company_metrics WHERE company_id = current_setting('test.co_a_id')::uuid),
+  2, 'M03b: total_benefits = 2 (e1 active + e3 searching) — counts any status');
 SELECT is((SELECT co2_all_time_kg FROM public.company_metrics WHERE company_id = current_setting('test.co_a_id')::uuid),
   8.25::numeric, 'M04: co2_all_time_kg = 8.25 (e1 this week)');
 
@@ -108,6 +120,8 @@ INSERT INTO public.bike_benefits (user_id, step, committed_at, delivered_at)
 VALUES (current_setting('test.e2_id')::uuid, 'sign_contract', now(), now());
 SELECT is((SELECT active_benefits FROM public.company_metrics WHERE company_id = current_setting('test.co_a_id')::uuid),
   2, 'M06: benefit INSERT live-bumps active_benefits to 2 (trigger)');
+SELECT is((SELECT total_benefits FROM public.company_metrics WHERE company_id = current_setting('test.co_a_id')::uuid),
+  3, 'M06b: benefit INSERT live-bumps total_benefits to 3 (e1+e2 active, e3 searching)');
 SELECT is((SELECT co2_all_time_kg FROM public.company_metrics WHERE company_id = current_setting('test.co_a_id')::uuid),
   16.5::numeric, 'M07: CO₂ live-recomputed to 16.5 (e1+e2) via stats→metrics cascade');
 

@@ -13,7 +13,8 @@ SET search_path TO extensions, public;
 --   company B: 1 ledger row (must NOT be visible to A's HR)
 --
 --  L01 ledger current-week total=3  L02 active=2
---  L03 monthly view = last snapshot in month (active=20)  L04 (total=22)
+--  L03 monthly view = last snapshot in month (active=20)  L04 (total_accounts=22)
+--  L04b monthly view total_benefits=12 (last week of month)
 --  L05 RLS HR sees own ledger  L06 RLS HR cannot see B's ledger
 -- ============================================================
 
@@ -46,13 +47,13 @@ BEGIN
     ('i3@' || v_dom_a, v_co_a, 'I3', 'A', 'inactive'::public.user_profile_status);
 
   -- Synthetic Jan-2026 snapshots (two distinct weeks, same month) for company A.
-  INSERT INTO public.company_ledger (company_id, period, total_accounts, active_accounts, active_benefits) VALUES
-    (v_co_a, date '2026-01-05', 10, 10, 4),   -- earlier week in Jan
-    (v_co_a, date '2026-01-26', 22, 20, 9);   -- later week in Jan → wins the month
+  INSERT INTO public.company_ledger (company_id, period, total_accounts, active_accounts, active_benefits, total_benefits) VALUES
+    (v_co_a, date '2026-01-05', 10, 10, 4,  6),   -- earlier week in Jan
+    (v_co_a, date '2026-01-26', 22, 20, 9, 12);   -- later week in Jan → wins the month
 
   -- Company B ledger row (RLS isolation target).
-  INSERT INTO public.company_ledger (company_id, period, total_accounts, active_accounts, active_benefits)
-  VALUES (v_co_b, date '2026-01-05', 5, 5, 1);
+  INSERT INTO public.company_ledger (company_id, period, total_accounts, active_accounts, active_benefits, total_benefits)
+  VALUES (v_co_b, date '2026-01-05', 5, 5, 1, 2);
 
   PERFORM set_config('test.hr_id',   v_hr::text,   false);
   PERFORM set_config('test.co_a_id', v_co_a::text, false);
@@ -60,7 +61,7 @@ BEGIN
 END;
 $$;
 
-SELECT plan(6);
+SELECT plan(7);
 
 -- ── refresh_company_ledger snapshots company_metrics into the current week ────
 SELECT public.refresh_company_ledger();
@@ -83,6 +84,10 @@ SELECT is(
   (SELECT total_accounts FROM public.company_metrics_monthly
    WHERE company_id = current_setting('test.co_a_id')::uuid AND month = date '2026-01-01'),
   22, 'L04: monthly view Jan-2026 total_accounts = 22 (last week of month)');
+SELECT is(
+  (SELECT total_benefits FROM public.company_metrics_monthly
+   WHERE company_id = current_setting('test.co_a_id')::uuid AND month = date '2026-01-01'),
+  12, 'L04b: monthly view Jan-2026 total_benefits = 12 (last week of month)');
 
 -- ── RLS: HR of A reads only their own company's ledger ────────────────────────
 SET LOCAL ROLE authenticated;

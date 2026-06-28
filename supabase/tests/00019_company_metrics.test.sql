@@ -85,7 +85,7 @@ BEGIN
 END;
 $$;
 
-SELECT plan(13);
+SELECT plan(19);
 
 -- Compute CO₂ stats (also cascades to metrics CO₂ via the stats trigger) + counts.
 SELECT public.refresh_company_co2_stats();
@@ -140,6 +140,24 @@ SELECT ok(
 SELECT ok(
   NOT EXISTS(SELECT 1 FROM public.company_metrics WHERE company_id = current_setting('test.co_b_id')::uuid),
   'M10: HR cannot see another company''s metrics');
+
+-- ── RPC returns ALL FIVE numbers, all-time (p_from NULL), matching the live table ─
+SELECT is((SELECT active_accounts FROM public.get_company_metrics(NULL, now())),
+  4, 'M11: RPC all-time active_accounts = 4');
+SELECT is((SELECT total_accounts  FROM public.get_company_metrics(NULL, now())),
+  4, 'M12: RPC all-time total_accounts = 4');
+SELECT is((SELECT active_benefits FROM public.get_company_metrics(NULL, now())),
+  2, 'M13: RPC all-time active_benefits = 2');
+SELECT is((SELECT total_benefits  FROM public.get_company_metrics(NULL, now())),
+  3, 'M14: RPC all-time total_benefits = 3 (any status) — matches company_metrics');
+SELECT is((SELECT co2_kg          FROM public.get_company_metrics(NULL, now())),
+  16.5::numeric, 'M15: RPC all-time co2_kg = 16.5');
+
+-- ── Windowed denominator is CUMULATIVE as of p_to (ignores p_from) ───────────────
+-- A LAST-DAY window narrows nothing here (all rows just created), but the key proof
+-- is that total_benefits is NOT filtered by p_from — it stays the full denominator.
+SELECT is((SELECT total_benefits FROM public.get_company_metrics(now() - interval '1 day', now())),
+  3, 'M16: RPC windowed total_benefits stays cumulative-as-of-to (3, ignores p_from)');
 
 RESET ROLE;
 

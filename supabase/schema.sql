@@ -799,7 +799,7 @@ $$;
 ALTER FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_company_metrics"("p_from" timestamp with time zone DEFAULT NULL::timestamp with time zone, "p_to" timestamp with time zone DEFAULT "now"()) RETURNS TABLE("active_accounts" integer, "active_benefits" integer, "co2_kg" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_company_metrics"("p_from" timestamp with time zone DEFAULT NULL::timestamp with time zone, "p_to" timestamp with time zone DEFAULT "now"()) RETURNS TABLE("active_accounts" integer, "total_accounts" integer, "active_benefits" integer, "total_benefits" integer, "co2_kg" numeric)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -827,12 +827,21 @@ BEGIN
        GROUP BY pi.id
      ) a
      WHERE (p_from IS NULL OR a.last_activity >= p_from) AND a.last_activity <= v_to),
+    -- total accounts that existed by the window end (cumulative as of to)
+    (SELECT count(*)::int FROM public.profile_invites pi
+       WHERE pi.company_id = v_company
+         AND pi.created_at <= v_to),
     -- active benefits touched in [from,to]
     (SELECT count(*)::int FROM public.bike_benefits bb
        JOIN public.profiles p ON p.user_id = bb.user_id
        WHERE p.company_id = v_company
          AND bb.benefit_status = 'active'::public.benefit_status
          AND (p_from IS NULL OR bb.updated_at >= p_from) AND bb.updated_at <= v_to),
+    -- total benefits that existed by the window end (cumulative as of to)
+    (SELECT count(*)::int FROM public.bike_benefits bb
+       JOIN public.profiles p ON p.user_id = bb.user_id
+       WHERE p.company_id = v_company
+         AND bb.created_at <= v_to),
     -- CO₂ saved across weeks whose Monday falls in [from,to]
     (SELECT COALESCE(round(sum(s.kg_co2_saved), 3), 0) FROM public.company_co2_stats s
        WHERE s.company_id = v_company
@@ -844,7 +853,7 @@ $$;
 ALTER FUNCTION "public"."get_company_metrics"("p_from" timestamp with time zone, "p_to" timestamp with time zone) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_company_metrics"("p_from" timestamp with time zone, "p_to" timestamp with time zone) IS 'HR Reports "at a glance" reader. Returns active_accounts / active_benefits / co2_kg for the calling HR/admin''s own company over [p_from, p_to] (p_from NULL = all-time, p_to defaults now()). Computed on read — any range, no precomputed windows. PostgREST: POST /rest/v1/rpc/get_company_metrics. FE refetches on each company_metrics realtime ping. See llm-agent-assist/plans/company-metrics-dashboard.md.';
+COMMENT ON FUNCTION "public"."get_company_metrics"("p_from" timestamp with time zone, "p_to" timestamp with time zone) IS 'HR Reports "at a glance" reader. Returns active_accounts / total_accounts / active_benefits / total_benefits / co2_kg for the calling HR/admin''s own company over [p_from, p_to] (p_from NULL = all-time, p_to defaults now()). Numerators are windowed (touched in range); totals are cumulative as of p_to (existed by window end) so active/total is a coherent same-window ratio. Computed on read — any range, no precomputed windows. PostgREST: POST /rest/v1/rpc/get_company_metrics. FE subscribes to company_metrics realtime as a beacon and refetches this for the selected window. See llm-agent-assist/plans/company-metrics-dashboard.md.';
 
 
 

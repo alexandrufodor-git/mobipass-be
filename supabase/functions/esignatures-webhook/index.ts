@@ -1,6 +1,6 @@
 // Setup type definitions for built-in Supabase Runtime APIs
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { ESIGNATURES_VAULT_KEY, EsigEvents, EsigToContractStatus, NotificationEvent, UserRoles } from "../_shared/constants.ts"
+import { ESIGNATURES_VAULT_KEY, EsigEvents, EsigToContractStatus, NotificationEvent } from "../_shared/constants.ts"
 import { makeRestClient, RestClient } from "../_shared/supabaseRest.ts"
 import { sendFcm } from "../_shared/fcm.ts"
 import { sendNotification } from "../_shared/notifications.ts"
@@ -57,28 +57,30 @@ async function sendWebhookNotifications(
   signerEmail: string,
   contract: { id: string; bike_benefit_id: string; user_id: string },
 ): Promise<void> {
-  const signer = await db.getOne<{ user_id: string; company_id: string; first_name: string; last_name: string; user_roles: { role: string }[] }>(
+  const signer = await db.getOne<{ user_id: string; company_id: string; first_name: string; last_name: string }>(
     "profiles",
     `email=eq.${encodeURIComponent(signerEmail)}`,
-    "user_id,company_id,first_name,last_name,user_roles(role)"
+    "user_id,company_id,first_name,last_name"
   )
   if (!signer) return
 
-  const role = signer.user_roles?.[0]?.role
+  // Route by identity, not by role: contract.user_id is the employee this contract
+  // belongs to. A multi-role user who is both HR and an employee must still be
+  // treated as the employer here — comparing user_ids is unambiguous, whereas
+  // reading user_roles[0] mis-classifies such users.
+  const signerIsEmployee = signer.user_id === contract.user_id
 
-  if (role === UserRoles.HR) {
-    // HR signed → notify employee via FCM only
-    const notification = event === EsigEvents.SIGNED
-      ? { title: "Contract Signed", body: "HR has signed your contract.", event: NotificationEvent.CONTRACT_SIGNED_HR, bikeBenefitId: contract.bike_benefit_id }
-      : event === EsigEvents.CONTRACT_SIGNED
-      ? { title: "Contract Approved", body: "Your contract has been fully approved!", event: NotificationEvent.CONTRACT_APPROVED, bikeBenefitId: contract.bike_benefit_id }
-      : null
-
-    if (notification) {
-      sendFcm(db, contract.user_id, notification)
-        .catch((err) => console.error("[webhook] fcm error:", err))
+  if (!signerIsEmployee) {
+    // Employer / HR signed → notify the employee via FCM
+    if (event === EsigEvents.SIGNED) {
+      sendFcm(db, contract.user_id, {
+        title: "Contract Signed",
+        body: "HR has signed your contract.",
+        event: NotificationEvent.CONTRACT_SIGNED_HR,
+        bikeBenefitId: contract.bike_benefit_id,
+      }).catch((err) => console.error("[webhook] fcm error:", err))
     }
-  } else if (role === UserRoles.EMPLOYEE && signer.company_id) {
+  } else if (signer.company_id) {
     // Employee acted → insert notification for HR dashboard
     sendNotification(db, signer.company_id, "contract_update", EsigToContractStatus[event] ?? event, {
       user_id: contract.user_id,
@@ -158,8 +160,17 @@ Deno.serve(async (req) => {
     console.log("[webhook] event logged only (no timestamp mapping):", parsed.event)
   }
 
-  // 7. Send notifications based on signer role
-  if (parsed.signerEmail) {
+  // 7. Send notifications
+  if (parsed.event === EsigEvents.CONTRACT_SIGNED) {
+    // Fully executed. eSignatures omits a signer email on this event, so notify
+    // the employee directly — no signer resolution needed.
+    sendFcm(db, contract.user_id, {
+      title: "Contract Approved",
+      body: "Your contract has been fully approved!",
+      event: NotificationEvent.CONTRACT_APPROVED,
+      bikeBenefitId: contract.bike_benefit_id,
+    }).catch((err) => console.error("[webhook] fcm error:", err))
+  } else if (parsed.signerEmail) {
     sendWebhookNotifications(db, parsed.event, parsed.signerEmail, contract)
       .catch((err) => console.error("[webhook] notification error:", err))
   }

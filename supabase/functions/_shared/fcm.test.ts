@@ -1,18 +1,23 @@
 // Unit tests for the FCM helper (supabase/functions/_shared/fcm.ts).
 // Run with: deno test --allow-env supabase/functions/_shared/fcm.test.ts
+//
+// Auth is keyless (Workload Identity Federation): getAccessToken() signs an RS256
+// JWT with the Vault key `fcm_wif_private_key`, exchanges it at Google STS, then
+// impersonates the Firebase Admin SDK SA. The mocks below stub those two hops.
 
 import { assertEquals } from "jsr:@std/assert"
 import { stub } from "jsr:@std/testing/mock"
 import { sendFcm, type FcmNotification } from "./fcm.ts"
 import type { RestClient } from "./supabaseRest.ts"
 
+const STS_HOST = "sts.googleapis.com"
+const IAM_HOST = "iamcredentials.googleapis.com"
+const FCM_HOST = "fcm.googleapis.com"
+
 // ─── Test helpers ────────────────────────────────────────────────────────────
 
-/**
- * Generates a minimal service account JSON string with a real RSA-2048 key
- * so that the JWT signing path in getAccessToken() can execute without error.
- */
-async function makeServiceAccountJson(tokenUri = "https://oauth2.googleapis.com/token"): Promise<string> {
+/** A real RSA-2048 PKCS8 PEM so the JWT signing path in getAccessToken() runs. */
+async function makePrivateKeyPem(): Promise<string> {
   const kp = await crypto.subtle.generateKey(
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]) },
     true,
@@ -20,32 +25,21 @@ async function makeServiceAccountJson(tokenUri = "https://oauth2.googleapis.com/
   )
   const pkcs8 = await crypto.subtle.exportKey("pkcs8", kp.privateKey)
   const b64 = btoa(String.fromCharCode(...new Uint8Array(pkcs8)))
-  return JSON.stringify({
-    client_email: "svc@test-proj.iam.gserviceaccount.com",
-    token_uri: tokenUri,
-    private_key: `-----BEGIN PRIVATE KEY-----\n${b64}\n-----END PRIVATE KEY-----`,
-  })
+  return `-----BEGIN PRIVATE KEY-----\n${b64.match(/.{1,64}/g)!.join("\n")}\n-----END PRIVATE KEY-----\n`
 }
 
 /**
- * Builds a mock RestClient where rpc() returns values in call order:
- *   call 0 → firebase_project_id vault secret (or null)
- *   call 1 → firebase_service_account vault secret (or null)
+ * Mock RestClient. rpc() returns values in call order:
+ *   call 0 → fcm_wif_private_key vault secret (PEM or null)
  */
-function makeMockDb(
-  rpcReturns: (string | null)[],
-  getOneReturn: unknown = null,
-): RestClient {
+function makeMockDb(rpcReturns: (string | null)[], getOneReturn: unknown = null): RestClient {
   let rpcCall = 0
   return {
     getOne: () => Promise.resolve(getOneReturn as never),
     post: () => Promise.resolve(new Response(null, { status: 201 })),
     upsert: () => Promise.resolve(new Response(null, { status: 201 })),
     patch: () => Promise.resolve(),
-    rpc: () => {
-      const val = rpcReturns[rpcCall++] ?? null
-      return Promise.resolve(val as never)
-    },
+    rpc: () => Promise.resolve((rpcReturns[rpcCall++] ?? null) as never),
   }
 }
 
@@ -56,143 +50,112 @@ const NOTIFICATION: FcmNotification = {
   bikeBenefitId: "benefit-uuid-001",
 }
 
+/** Stub fetch: STS + impersonation succeed; FCM handled by `onFcm`. */
+function stubHappyAuth(onFcm: (url: string, init?: RequestInit) => Response) {
+  return stub(globalThis, "fetch", (input: unknown, init?: unknown): Promise<Response> => {
+    const url = String(input instanceof Request ? input.url : input)
+    if (url.includes(STS_HOST)) {
+      return Promise.resolve(new Response(JSON.stringify({ access_token: "fed-token" }), { status: 200 }))
+    }
+    if (url.includes(IAM_HOST)) {
+      return Promise.resolve(new Response(JSON.stringify({ accessToken: "ya29.imp-token" }), { status: 200 }))
+    }
+    if (url.includes(FCM_HOST)) return Promise.resolve(onFcm(url, init as RequestInit | undefined))
+    throw new Error(`Unexpected fetch call: ${url}`)
+  })
+}
+
+const noFetch = () => { throw new Error("fetch must not be called") }
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-Deno.test("sendFcm: returns early when firebase_project_id vault secret is missing", async () => {
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (_input: unknown, _init?: unknown) => { throw new Error("fetch must not be called") },
-  )
-  try {
-    // rpc returns null for firebase_project_id
-    const db = makeMockDb([null])
-    await sendFcm(db, "user-uuid", NOTIFICATION) // must not throw
-  } finally {
-    fetchStub.restore()
-  }
-})
-
 Deno.test("sendFcm: returns early when profile is not found", async () => {
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (_input: unknown, _init?: unknown) => { throw new Error("fetch must not be called") },
-  )
+  const fetchStub = stub(globalThis, "fetch", noFetch)
   try {
-    // rpc returns project ID; getOne returns null (no profile)
-    const db = makeMockDb(["test-project"], null)
-    await sendFcm(db, "user-uuid", NOTIFICATION)
+    await sendFcm(makeMockDb([await makePrivateKeyPem()], null), "user-uuid", NOTIFICATION)
   } finally {
     fetchStub.restore()
   }
 })
 
 Deno.test("sendFcm: returns early when fcm_token is null", async () => {
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (_input: unknown, _init?: unknown) => { throw new Error("fetch must not be called") },
-  )
+  const fetchStub = stub(globalThis, "fetch", noFetch)
   try {
-    const db = makeMockDb(["test-project"], { fcm_token: null })
+    await sendFcm(makeMockDb([await makePrivateKeyPem()], { fcm_token: null }), "user-uuid", NOTIFICATION)
+  } finally {
+    fetchStub.restore()
+  }
+})
+
+Deno.test("sendFcm: returns early when WIF private key vault secret is missing", async () => {
+  const fetchStub = stub(globalThis, "fetch", noFetch)
+  try {
+    // profile has a token, but the vault key is absent → no token exchange attempted
+    await sendFcm(makeMockDb([null], { fcm_token: "device-token" }), "user-uuid", NOTIFICATION)
+  } finally {
+    fetchStub.restore()
+  }
+})
+
+Deno.test("sendFcm: returns early when WIF private key is not a valid PEM", async () => {
+  const fetchStub = stub(globalThis, "fetch", noFetch)
+  try {
+    const db = makeMockDb(["-----BEGIN PRIVATE KEY-----\nnot-base64-!!!\n-----END PRIVATE KEY-----"], { fcm_token: "device-token" })
     await sendFcm(db, "user-uuid", NOTIFICATION)
   } finally {
     fetchStub.restore()
   }
 })
 
-Deno.test("sendFcm: returns early when firebase_service_account vault secret is missing", async () => {
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (_input: unknown, _init?: unknown) => { throw new Error("fetch must not be called") },
-  )
-  try {
-    // rpc: project ID ok, service account null
-    const db = makeMockDb(["test-project", null], { fcm_token: "device-token" })
-    await sendFcm(db, "user-uuid", NOTIFICATION)
-  } finally {
-    fetchStub.restore()
-  }
-})
-
-Deno.test("sendFcm: returns early when firebase_service_account vault secret is not valid JSON", async () => {
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (_input: unknown, _init?: unknown) => { throw new Error("fetch must not be called") },
-  )
-  try {
-    // Simulate vault storing only the raw PEM key instead of the full service account JSON
-    const db = makeMockDb(["test-project", "-----BEGIN PRIVATE KEY-----\nnotvalidjson"], { fcm_token: "device-token" })
-    await sendFcm(db, "user-uuid", NOTIFICATION)
-  } finally {
-    fetchStub.restore()
-  }
-})
-
-Deno.test("sendFcm: returns early when Google token exchange fails", async () => {
-  const svcAccount = await makeServiceAccountJson()
+Deno.test("sendFcm: returns early when STS token exchange fails", async () => {
   let fcmCalled = false
-
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (input: unknown, _init?: unknown): Promise<Response> => {
-      const url = String(input instanceof Request ? input.url : input)
-      if (url.includes("oauth2.googleapis.com")) {
-        return Promise.resolve(new Response("Unauthorized", { status: 401 }))
-      }
-      fcmCalled = true
-      return Promise.resolve(new Response("{}", { status: 200 }))
-    },
-  )
+  const fetchStub = stub(globalThis, "fetch", (input: unknown): Promise<Response> => {
+    const url = String(input instanceof Request ? input.url : input)
+    if (url.includes(STS_HOST)) return Promise.resolve(new Response("Unauthorized", { status: 401 }))
+    if (url.includes(FCM_HOST)) { fcmCalled = true }
+    return Promise.resolve(new Response("{}", { status: 200 }))
+  })
   try {
-    const db = makeMockDb(["test-project", svcAccount], { fcm_token: "device-token" })
-    await sendFcm(db, "user-uuid", NOTIFICATION)
-    assertEquals(fcmCalled, false, "FCM endpoint must not be called when token exchange fails")
+    await sendFcm(makeMockDb([await makePrivateKeyPem()], { fcm_token: "device-token" }), "user-uuid", NOTIFICATION)
+    assertEquals(fcmCalled, false, "FCM must not be called when STS fails")
+  } finally {
+    fetchStub.restore()
+  }
+})
+
+Deno.test("sendFcm: returns early when SA impersonation fails", async () => {
+  let fcmCalled = false
+  const fetchStub = stub(globalThis, "fetch", (input: unknown): Promise<Response> => {
+    const url = String(input instanceof Request ? input.url : input)
+    if (url.includes(STS_HOST)) return Promise.resolve(new Response(JSON.stringify({ access_token: "fed-token" }), { status: 200 }))
+    if (url.includes(IAM_HOST)) return Promise.resolve(new Response("PERMISSION_DENIED", { status: 403 }))
+    if (url.includes(FCM_HOST)) { fcmCalled = true }
+    return Promise.resolve(new Response("{}", { status: 200 }))
+  })
+  try {
+    await sendFcm(makeMockDb([await makePrivateKeyPem()], { fcm_token: "device-token" }), "user-uuid", NOTIFICATION)
+    assertEquals(fcmCalled, false, "FCM must not be called when impersonation fails")
   } finally {
     fetchStub.restore()
   }
 })
 
 Deno.test("sendFcm: sends push with correct payload on happy path", async () => {
-  const svcAccount = await makeServiceAccountJson()
   const fcmCalls: { url: string; headers: Record<string, string>; body: unknown }[] = []
-
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (input: unknown, init?: unknown): Promise<Response> => {
-      const url = String(input instanceof Request ? input.url : input)
-      const options = init as RequestInit | undefined
-      if (url.includes("oauth2.googleapis.com")) {
-        return Promise.resolve(
-          new Response(JSON.stringify({ access_token: "ya29.test-token" }), { status: 200 }),
-        )
-      }
-      if (url.includes("fcm.googleapis.com")) {
-        fcmCalls.push({
-          url,
-          headers: Object.fromEntries(new Headers(options?.headers as HeadersInit).entries()),
-          body: options?.body ? JSON.parse(options.body as string) : null,
-        })
-        return Promise.resolve(new Response("{}", { status: 200 }))
-      }
-      throw new Error(`Unexpected fetch call: ${url}`)
-    },
-  )
+  const fetchStub = stubHappyAuth((url, init) => {
+    fcmCalls.push({
+      url,
+      headers: Object.fromEntries(new Headers(init?.headers as HeadersInit).entries()),
+      body: init?.body ? JSON.parse(init.body as string) : null,
+    })
+    return new Response("{}", { status: 200 })
+  })
   try {
-    const db = makeMockDb(["test-project", svcAccount], { fcm_token: "device-token-xyz" })
-    await sendFcm(db, "user-uuid", NOTIFICATION)
+    await sendFcm(makeMockDb([await makePrivateKeyPem()], { fcm_token: "device-token-xyz" }), "user-uuid", NOTIFICATION)
 
     assertEquals(fcmCalls.length, 1, "FCM must be called exactly once")
-    assertEquals(
-      fcmCalls[0].url,
-      "https://fcm.googleapis.com/v1/projects/test-project/messages:send",
-    )
-    assertEquals(fcmCalls[0].headers["authorization"], "Bearer ya29.test-token")
+    assertEquals(fcmCalls[0].url, "https://fcm.googleapis.com/v1/projects/mobipass-a9056/messages:send")
+    assertEquals(fcmCalls[0].headers["authorization"], "Bearer ya29.imp-token")
 
     const msg = (fcmCalls[0].body as { message: Record<string, unknown> }).message
     assertEquals(msg.token, "device-token-xyz")
@@ -206,26 +169,10 @@ Deno.test("sendFcm: sends push with correct payload on happy path", async () => 
 })
 
 Deno.test("sendFcm: handles FCM API error gracefully without throwing", async () => {
-  const svcAccount = await makeServiceAccountJson()
-
-  const fetchStub = stub(
-    globalThis,
-    "fetch",
-    (input: unknown, _init?: unknown): Promise<Response> => {
-      const url = String(input instanceof Request ? input.url : input)
-      if (url.includes("oauth2.googleapis.com")) {
-        return Promise.resolve(
-          new Response(JSON.stringify({ access_token: "ya29.test-token" }), { status: 200 }),
-        )
-      }
-      // FCM returns UNREGISTERED — stale token
-      return Promise.resolve(new Response("UNREGISTERED", { status: 404 }))
-    },
-  )
+  const fetchStub = stubHappyAuth(() => new Response("UNREGISTERED", { status: 404 }))
   try {
-    const db = makeMockDb(["test-project", svcAccount], { fcm_token: "stale-token" })
     // Must complete without throwing
-    await sendFcm(db, "user-uuid", NOTIFICATION)
+    await sendFcm(makeMockDb([await makePrivateKeyPem()], { fcm_token: "stale-token" }), "user-uuid", NOTIFICATION)
   } finally {
     fetchStub.restore()
   }

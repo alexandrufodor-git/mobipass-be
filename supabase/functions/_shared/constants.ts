@@ -25,8 +25,8 @@ export function getCorsHeaders(origin?: string): Record<string, string> {
 export const ESIGNATURES_API_URL  = "https://esignatures.com/api/contracts"
 export const ESIGNATURES_VAULT_KEY = "esignature_api_key"
 
-// Firebase Cloud Messaging
-export const FIREBASE_VAULT_KEY = "firebase_service_account"
+// Firebase Cloud Messaging auth is keyless (Workload Identity Federation);
+// config + vault keys live in _shared/fcm.ts, no service-account JSON.
 
 export const EsigEvents = {
   VIEWED:          "signer-viewed-the-contract",

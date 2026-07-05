@@ -456,6 +456,13 @@ verify_jwt = true
 import_map = "./functions/update-employee-pii/deno.json"
 entrypoint = "./functions/update-employee-pii/index.ts"
 
+# Self-service account deletion. Deletes the caller's own auth user (own JWT sub only).
+[functions.delete-account]
+enabled = true
+verify_jwt = true
+import_map = "./functions/delete-account/deno.json"
+entrypoint = "./functions/delete-account/index.ts"
+
 # Admin-only one-shot backfill. Requires admin role — invoked manually after deploy.
 [functions.admin-encrypt-pii]
 enabled = true

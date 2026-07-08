@@ -58,6 +58,55 @@ async function sendOtp(supabaseUrl: string, serviceKey: string, email: string): 
   })
 }
 
+// Onboarding (handle_user_registration) only fires on an auth.users INSERT or
+// the first email_confirmed_at NULL→confirmed transition. A pre-existing,
+// already-confirmed auth account with NO profile is "orphaned": an OTP login
+// against it just mints a session and never re-runs onboarding, leaving a
+// profile-less user the app can't use. Before sending the OTP, delete such an
+// account so the OTP-verify creates a fresh row that fires the trigger.
+//
+// Only accounts with NO profile are deleted — an orphan has zero app-side data,
+// so this is safe; returning users (has_profile=true) and brand-new emails
+// (no auth row) are left untouched. Best-effort + fail-open: any failure here
+// is logged and swallowed so the OTP still goes out — this guard can never make
+// registration worse than it is today.
+// Returns true iff a stale orphan was found and deleted — the caller stamps
+// this into the audit row (result_payload.orphan_reset) so "was this user
+// orphaned and auto-healed?" is answerable from integration_messages.
+async function resetStaleOrphan(
+  db: RestClient,
+  supabaseUrl: string,
+  serviceKey: string,
+  email: string,
+): Promise<boolean> {
+  try {
+    const hits = await db.rpc<Array<{ user_id: string; has_profile: boolean }>>(
+      "lookup_auth_user",
+      { p_email: email },
+    )
+    const existing = hits?.[0]
+    if (!existing || existing.has_profile) return false
+
+    const res = await fetch(`${supabaseUrl}/auth/v1/admin/users/${existing.user_id}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${serviceKey}`,
+        apikey: serviceKey,
+        "Content-Type": "application/json",
+      },
+    })
+    if (!res.ok) {
+      console.error("[register] stale-orphan delete failed:", res.status, await res.text().catch(() => ""))
+      return false
+    }
+    console.log(`[register] reset stale orphan auth user ${existing.user_id}`)
+    return true
+  } catch (err) {
+    console.error("[register] stale-orphan reset skipped (non-fatal):", err)
+    return false
+  }
+}
+
 async function auditAttempt(
   db: RestClient,
   payload: {
@@ -69,6 +118,7 @@ async function auditAttempt(
     dob_hash:      string | null
     first_norm:    string | null
     last_norm:     string | null
+    orphan_reset?: boolean
     candidates:    Array<{
       invite_id:           string
       first_score:         number
@@ -100,6 +150,7 @@ async function auditAttempt(
         dob_hash:     payload.dob_hash,
         first_norm:   payload.first_norm,
         last_norm:    payload.last_norm,
+        orphan_reset: payload.orphan_reset ?? false,
         candidates:   payload.candidates.slice(0, 5),
       },
       processed_at:   new Date().toISOString(),
@@ -143,6 +194,7 @@ Deno.serve(async (req) => {
       return json(Errors.INVITE_INACTIVE, 403, origin)
     }
 
+    const orphanReset = await resetStaleOrphan(db, SUPABASE_URL, SERVICE_KEY, email)
     const otp = await sendOtp(SUPABASE_URL, SERVICE_KEY, email)
     if (!otp.ok) {
       const details = await otp.json().catch(() => ({}))
@@ -151,7 +203,7 @@ Deno.serve(async (req) => {
     await auditAttempt(db, {
       company_id: direct.company_id, decision: "claim", claim_type: "email_direct",
       invite_id: direct.id, email_domain: emailDomain,
-      dob_hash: null, first_norm: null, last_norm: null, candidates: [],
+      dob_hash: null, first_norm: null, last_norm: null, orphan_reset: orphanReset, candidates: [],
     })
     return json({ success: true, claim: "email_direct" }, 200, origin)
   }
@@ -268,6 +320,7 @@ Deno.serve(async (req) => {
   // picks it up on OTP verify.
   await db.patch("profile_invites", `id=eq.${winner.id}`, { email })
 
+  const orphanReset = await resetStaleOrphan(db, SUPABASE_URL, SERVICE_KEY, email)
   const otp = await sendOtp(SUPABASE_URL, SERVICE_KEY, email)
   if (!otp.ok) {
     const details = await otp.json().catch(() => ({}))
@@ -279,7 +332,7 @@ Deno.serve(async (req) => {
     company_id: company.id, decision: "claim", claim_type: claimType,
     invite_id: winner.id, email_domain: emailDomain,
     dob_hash: dobHash, first_norm: firstNorm, last_norm: lastNorm,
-    candidates: auditCandidates,
+    orphan_reset: orphanReset, candidates: auditCandidates,
   })
   return json({ success: true, claim: claimType, confidence: winner.total }, 200, origin)
 })

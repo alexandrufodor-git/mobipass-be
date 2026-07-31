@@ -156,6 +156,12 @@ previous run; only re-do them when rotating. The Maestro-side env file
 (testing/maestro/.env.local) MUST hold the same E2E_SECRET / E2E_DEFAULT_PASSWORD
 values that are in prod Vault — that's the #1 source of invalid_credentials.
 
+e2e_email — the single E2E account address. e2e-otp reads it to decide which
+address it may mint an OTP for, so without it that function fails closed with
+503 e2e_email_not_configured. Set it once:
+
+   SELECT vault.create_secret('fodor.horatiu.alexandru@gmail.com', 'e2e_email');
+
 For e2e_reges (the one new secret in this refactor), paste THIS into the
 dashboard SQL editor (uses dollar-quoting so the JSON's quotes don't fight
 SQL's quoting):
@@ -212,6 +218,17 @@ else
   PASSWORD=$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-20)
   echo "Generated new E2E_DEFAULT_PASSWORD:"
   echo "  $PASSWORD"
+fi
+
+# The single E2E account. Vault-sourced (not hardcoded in the edge functions) so
+# local and prod share one definition and rotating it needs no redeploy — e2e-otp
+# reads `e2e_email` to decide which address it may mint an OTP for.
+if [[ -n "${E2E_EMAIL:-}" ]]; then
+  ACCOUNT_EMAIL="$E2E_EMAIL"
+  echo "Using supplied E2E_EMAIL: $ACCOUNT_EMAIL"
+else
+  ACCOUNT_EMAIL="fodor.horatiu.alexandru@gmail.com"
+  echo "Using default E2E_EMAIL: $ACCOUNT_EMAIL"
 fi
 
 if [[ -n "${E2E_BIKE_ID:-}" ]]; then
@@ -275,6 +292,7 @@ echo
 upsert_secret "e2e_secret"           "$SECRET"
 upsert_secret "e2e_default_password" "$PASSWORD"
 upsert_secret "e2e_bike_id"          "$BIKE_ID"
+upsert_secret "e2e_email"            "$ACCOUNT_EMAIL"
 upsert_secret_stdin "e2e_reges"     < "$REGES_JSON_FILE"
 
 docker exec "$CONTAINER" psql -U postgres -c \

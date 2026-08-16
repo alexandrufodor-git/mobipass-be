@@ -9,7 +9,7 @@
 //
 //   2. confidence-claim
 //      The email does NOT exist on any invite. The caller must supply
-//      first_name, last_name, date_of_birth. We resolve the company by
+//      first_name and last_name; date_of_birth is optional. We resolve the company by
 //      email_domain, query match_pending_invite, score the candidates with
 //      a simple weighted sum, and either:
 //        - claim a single pending invite (UPDATE its email + send OTP), or
@@ -215,11 +215,10 @@ Deno.serve(async (req) => {
   const lastNorm  = normalizeName(body.last_name)
   const dob       = (body.date_of_birth || "").trim() || null
 
-  if (!firstNorm || !lastNorm || !dob) {
-    // Without the supplemental identity fields we have nothing to match
-    // against. Treat as not-invited rather than 400 — the legacy mobile
-    // client (email only) gets a clear "not_invited" instead of a confusing
-    // validation error.
+  if (!firstNorm || !lastNorm) {
+    // Not-invited rather than 400 so the legacy email-only client gets a clear
+    // error. DOB is optional by design (5.1.1(v)) — derived-email + name scores
+    // 0.70 against a 0.50 threshold; DOB still scores and still splits twins.
     await auditAttempt(db, {
       company_id: null, decision: "not_invited", claim_type: null,
       invite_id: null, email_domain: emailDomain,

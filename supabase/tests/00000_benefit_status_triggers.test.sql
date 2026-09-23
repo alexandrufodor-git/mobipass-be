@@ -108,9 +108,9 @@ SELECT is(
   'T05: step=book_live_test → searching'
 );
 
--- ── T06: set live_test_whatsapp_sent_at while on book_live_test → still searching
+-- ── T06: set live_test_sent_at while on book_live_test → still searching
 UPDATE public.bike_benefits
-SET live_test_whatsapp_sent_at = now()
+SET live_test_sent_at = now()
 WHERE id = (SELECT benefit_id FROM _fix00);
 
 SELECT is(
@@ -198,7 +198,7 @@ SELECT is(
 
 -- ── T14: second pass — set whatsapp while on commit_to_bike → testing
 UPDATE public.bike_benefits
-SET live_test_whatsapp_sent_at = now()
+SET live_test_sent_at = now()
 WHERE id = (SELECT benefit_id FROM _fix00);
 
 SELECT is(

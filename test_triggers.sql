@@ -35,7 +35,7 @@ BEGIN
     CASE WHEN v_bs = 'searching' THEN 'PASS' ELSE 'FAIL' END);
 
   -- 4. set whatsapp_sent_at (still on book_live_test) → still searching
-  UPDATE public.bike_benefits SET live_test_whatsapp_sent_at = now() WHERE id = v_id
+  UPDATE public.bike_benefits SET live_test_sent_at = now() WHERE id = v_id
   RETURNING benefit_status::text INTO v_bs;
   INSERT INTO trigger_test_results VALUES (4, 'whatsapp sent (on book_live_test)', 'searching', v_bs,
     CASE WHEN v_bs = 'searching' THEN 'PASS' ELSE 'FAIL' END);
@@ -73,7 +73,7 @@ BEGIN
   -- ══════ RESET to choose_bike ══════
   UPDATE public.bike_benefits SET step = 'choose_bike' WHERE id = v_id
   RETURNING benefit_status::text, contract_status::text,
-            live_test_whatsapp_sent_at, committed_at
+            live_test_sent_at, committed_at
   INTO v_bs, v_cs, v_wa, v_ca;
   INSERT INTO trigger_test_results VALUES (10, 'RESET → choose_bike',
     'searching / cs=NULL / wa=NULL / ca=NULL',
@@ -88,7 +88,7 @@ BEGIN
   INSERT INTO trigger_test_results VALUES (11, '[2nd] book_live_test', 'searching', v_bs,
     CASE WHEN v_bs = 'searching' THEN 'PASS' ELSE 'FAIL' END);
 
-  UPDATE public.bike_benefits SET live_test_whatsapp_sent_at = now() WHERE id = v_id
+  UPDATE public.bike_benefits SET live_test_sent_at = now() WHERE id = v_id
   RETURNING benefit_status::text INTO v_bs;
   INSERT INTO trigger_test_results VALUES (12, '[2nd] whatsapp sent', 'searching', v_bs,
     CASE WHEN v_bs = 'searching' THEN 'PASS' ELSE 'FAIL' END);

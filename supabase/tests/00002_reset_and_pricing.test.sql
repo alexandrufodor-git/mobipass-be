@@ -62,7 +62,7 @@ BEGIN
 
   UPDATE public.bike_benefits
   SET step = 'book_live_test',
-      live_test_whatsapp_sent_at = now()
+      live_test_sent_at = now()
   WHERE id = v_bb;
 
   UPDATE public.bike_benefits
@@ -112,10 +112,10 @@ WHERE id = (SELECT benefit_id FROM _fix02);
 
 -- ── Reset checks ─────────────────────────────────────────────
 
--- T01: live_test_whatsapp_sent_at cleared
+-- T01: live_test_sent_at cleared
 SELECT ok(
-  (SELECT live_test_whatsapp_sent_at IS NULL FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix02)),
-  'T01: reset clears live_test_whatsapp_sent_at'
+  (SELECT live_test_sent_at IS NULL FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix02)),
+  'T01: reset clears live_test_sent_at'
 );
 
 -- T02: committed_at cleared

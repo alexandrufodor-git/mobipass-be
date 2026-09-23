@@ -68,7 +68,7 @@ export interface BikeBenefit {
   live_test_lat: number | null;
   live_test_lon: number | null;
   live_test_location_name: string | null;
-  live_test_whatsapp_sent_at: string | null;
+  live_test_sent_at: string | null;
   live_test_checked_in_at: string | null;
   
   // Commitment
@@ -222,7 +222,7 @@ export interface ProfileInviteWithDetails {
   live_test_lat: number | null;
   live_test_lon: number | null;
   live_test_location_name: string | null;
-  live_test_whatsapp_sent_at: string | null;
+  live_test_sent_at: string | null;
   live_test_checked_in_at: string | null;
   
   // Order details

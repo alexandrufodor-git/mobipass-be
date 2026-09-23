@@ -2113,7 +2113,7 @@ BEGIN
   ELSIF NEW.step = 'choose_bike'::public.bike_benefit_step THEN
     IF TG_OP = 'UPDATE'
        AND (OLD.step IS NULL OR OLD.step <> 'choose_bike'::public.bike_benefit_step) THEN
-      NEW.live_test_whatsapp_sent_at  := NULL;
+      NEW.live_test_sent_at           := NULL;
       NEW.live_test_checked_in_at     := NULL;
       NEW.committed_at                := NULL;
       NEW.contract_requested_at       := NULL;
@@ -2149,7 +2149,7 @@ BEGIN
       WHERE  b.id = NEW.bike_id;
     END IF;
 
-    IF NEW.live_test_whatsapp_sent_at IS NOT NULL THEN
+    IF NEW.live_test_sent_at IS NOT NULL THEN
       NEW.benefit_status := 'testing'::public.benefit_status;
     ELSE
       NEW.benefit_status := 'searching'::public.benefit_status;
@@ -2254,7 +2254,7 @@ CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
     "user_id" "uuid" NOT NULL,
     "bike_id" "uuid",
     "live_test_location" "text",
-    "live_test_whatsapp_sent_at" timestamp with time zone,
+    "live_test_sent_at" timestamp with time zone,
     "live_test_checked_in_at" timestamp with time zone,
     "committed_at" timestamp with time zone,
     "checked_in_at" timestamp with time zone,
@@ -2289,6 +2289,10 @@ ALTER TABLE "public"."bike_benefits" OWNER TO "postgres";
 
 
 COMMENT ON COLUMN "public"."bike_benefits"."live_test_location_name" IS 'Human-readable name of the test location (e.g., "Maros Bike Cluj")';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_sent_at" IS 'When the employee tapped "Interested in a bike test" (step 2). NULL = test skipped or not yet requested.';
 
 
 

@@ -26,12 +26,12 @@ DO $$
 DECLARE
   v_co_a uuid;
   v_co_b uuid;
+  v_dom_a text := 'dob-a-' || (extract(epoch from clock_timestamp())::bigint) || '.example';
 BEGIN
   INSERT INTO public.companies (
     name, monthly_benefit_subsidy, contract_months, currency, email_domain
   ) VALUES (
-    'dob-co-a-' || gen_random_uuid()::text, 80.00, 36, 'RON',
-    'dob-a-' || (extract(epoch from clock_timestamp())::bigint) || '.example'
+    'dob-co-a-' || gen_random_uuid()::text, 80.00, 36, 'RON', v_dom_a
   ) RETURNING id INTO v_co_a;
 
   INSERT INTO public.companies (
@@ -65,7 +65,8 @@ BEGIN
     company_id, email, first_name, last_name, source, source_ref_id,
     birth_date_hash, derived_email
   ) VALUES (
-    v_co_a, 'claimed@dob-a.example', 'vlad', 'stan', 'reges', 't-dob-claimed',
+    -- email must match the company domain (enforce_email_matches_company_domain)
+    v_co_a, 'claimed@' || v_dom_a, 'vlad', 'stan', 'reges', 't-dob-claimed',
     'hash-dob-claimed', 'vlad.stan@dob-a.example'
   );
 

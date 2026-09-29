@@ -62,6 +62,10 @@ export const NotificationEvent = {
   SSO_CLAIM_PENDING:  "sso_claim_pending",
   SSO_CLAIM_APPROVED: "sso_claim_approved",
   SSO_CLAIM_REJECTED: "sso_claim_rejected",
+  // Copilot live test (user FCM only)
+  LIVE_TEST_BOOKED:   "live_test_booked",
+  LIVE_TEST_TODAY:    "live_test_today",
+  LIVE_TEST_CONFIRM:  "live_test_confirm",
 } as const
 
 export type NotificationEventType = typeof NotificationEvent[keyof typeof NotificationEvent]

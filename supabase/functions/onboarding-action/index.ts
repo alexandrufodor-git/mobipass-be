@@ -8,6 +8,7 @@ import { Errors, badRequest, forbidden, json } from "../_shared/constants.ts"
 import { corsResponse } from "../_shared/ioHelpers.ts"
 import { requireJwt, extractUserId } from "../_shared/auth.ts"
 import { makeRestClient } from "../_shared/supabaseRest.ts"
+import { claimAndSendLiveTestPush } from "../_shared/liveTestPush.ts"
 import { ACTIONS_NEEDING_BIKE, ActionBenefit, decide, isAction } from "./actions.ts"
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
@@ -79,7 +80,15 @@ Deno.serve(async (req) => {
       throw json(decision.error === "copilot_locked" ? Errors.COPILOT_LOCKED : Errors.TEST_NOT_CONFIRMABLE, 409, origin)
     }
 
-    return await writeBenefit("PATCH", `id=eq.${benefit.id}&user_id=eq.${userId}`, decision.patch, origin)
+    const res = await writeBenefit("PATCH", `id=eq.${benefit.id}&user_id=eq.${userId}`, decision.patch, origin)
+
+    // Copilot: the test date is already set, so the interest tap books it.
+    const label = benefit.copilot?.live_test_label
+    if (res.ok && action === "test_interest" && benefit.copilot?.enabled && label) {
+      claimAndSendLiveTestPush(SUPABASE_URL, SERVICE_KEY, db, userId, "booked", label, benefit.id)
+        .catch((err) => console.error("[onboarding-action] booked push error:", err))
+    }
+    return res
   } catch (e) {
     if (e instanceof Response) return e
     throw e

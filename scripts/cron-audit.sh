@@ -111,6 +111,16 @@ report() {
   echo "═══ end ═══"
 }
 
+cache_summary() {
+  q "select pg_size_pretty(pg_database_size(current_database())) as database,
+            pg_size_pretty(pg_total_relation_size('public.sync_run_cache')) as cache_table,
+            (select count(*) from public.sync_run_cache) as rows,
+            (select count(distinct run_id) from public.sync_run_cache) as runs,
+            (select min(r.started_at)::date from public.sync_run_cache c join public.sync_runs r on r.id = c.run_id) as oldest,
+            (select max(r.started_at)::date from public.sync_run_cache c join public.sync_runs r on r.id = c.run_id) as newest,
+            pg_size_pretty((select coalesce(sum(pg_column_size(payload)), 0) from public.sync_run_cache)) as live_payload;"
+}
+
 cache_list() {
   q "select r.id as run_id, r.started_at::timestamp(0) as started, r.mode, r.status,
             count(c.*) as scopes, pg_size_pretty(sum(pg_column_size(c.payload))) as size
@@ -172,6 +182,7 @@ Needs an existing `supabase link`. Nothing is deleted without --apply.
 
 COMMANDS
   (none)                                 Read-only report, sections below.
+  cache                                  Sizes: database, cache table, live payload, oldest/newest run.
   cache list                             One line per sync run still in the cache: date, mode, status, size.
   cache show <run_id>                    The scopes stored for that run, with item counts and sizes.
   cache show <run_id> <scope>            Peek inside one scope (arrays: first 3 items; objects: keys + sizes).
@@ -214,10 +225,11 @@ case "${1:-}" in
   -h|--help|help) usage ;;
   "")      report ;;
   cache)   shift; case "${1:-}" in
+             "")    cache_summary ;;
              list)  cache_list ;;
              show)  shift; cache_show "$@" ;;
              prune) shift; cache_prune "$@" ;;
-             *) echo "usage: $0 cache list|show|prune" >&2; exit 1 ;;
+             *) echo "usage: $0 cache [list|show|prune]" >&2; exit 1 ;;
            esac ;;
   history) shift; [[ "${1:-}" == prune ]] || { echo "usage: $0 history prune" >&2; exit 1; }
            shift; history_prune "$@" ;;

@@ -666,6 +666,9 @@ CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
     "live_test_lon" double precision,
     "prior_commute_mode" "text",
     "copilot_stopped_at" timestamp with time zone,
+    "live_test_booked_push_at" timestamp with time zone,
+    "live_test_today_push_at" timestamp with time zone,
+    "live_test_confirm_push_at" timestamp with time zone,
     CONSTRAINT "bike_benefits_prior_commute_mode_check" CHECK ((("prior_commute_mode" IS NULL) OR ("prior_commute_mode" = ANY (ARRAY['car'::"text", 'public_transit'::"text", 'bike'::"text", 'walk'::"text", 'motorcycle'::"text", 'other'::"text", 'unknown'::"text"]))))
 );
 
@@ -746,6 +749,18 @@ COMMENT ON COLUMN "public"."bike_benefits"."prior_commute_mode" IS 'Rider''s com
 
 
 COMMENT ON COLUMN "public"."bike_benefits"."copilot_stopped_at" IS 'When the employee committed while their company had copilot_stop_after_commit on. Cleared on reset to choose_bike.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_booked_push_at" IS 'Copilot: when the "test booked" push was sent.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_today_push_at" IS 'Copilot: when the "test is today" push was sent.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_confirm_push_at" IS 'Copilot: when the "confirm your test" push was sent.';
 
 
 
@@ -1582,6 +1597,77 @@ $$;
 ALTER FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."live_test_due_pushes"() RETURNS TABLE("benefit_id" "uuid", "user_id" "uuid", "kind" "text", "live_test_time" "text")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT b.id, b.user_id, k.kind, to_char(c.live_test_at AT TIME ZONE 'Europe/Bucharest', 'HH24:MI')
+  FROM public.bike_benefits b
+  JOIN public.profiles p  ON p.user_id = b.user_id
+  JOIN public.companies c ON c.id = p.company_id
+  CROSS JOIN LATERAL (VALUES
+    ('today',   b.live_test_today_push_at IS NULL
+                AND (c.live_test_at AT TIME ZONE 'Europe/Bucharest')::date = (now() AT TIME ZONE 'Europe/Bucharest')::date
+                AND (now() AT TIME ZONE 'Europe/Bucharest')::time >= time '08:00'
+                AND now() < c.live_test_at),
+    ('confirm', b.live_test_confirm_push_at IS NULL
+                AND now() >= c.live_test_at + make_interval(mins => c.live_test_reminder_offset_min))
+  ) AS k(kind, due)
+  WHERE c.copilot_stop_after_commit
+    AND c.live_test_at IS NOT NULL
+    AND b.step = 'book_live_test'
+    AND b.live_test_sent_at IS NOT NULL
+    AND b.live_test_checked_in_at IS NULL
+    AND k.due
+$$;
+
+
+ALTER FUNCTION "public"."live_test_due_pushes"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."live_test_due_pushes"() IS 'Copilot reminders due now: kind today (08:00 Bucharest on the test day, before the test) or confirm (live_test_at + live_test_reminder_offset_min, test not confirmed). Read by live_test_tick() and the live-test-push edge function.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."live_test_tick"() RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'net', 'vault'
+    AS $$
+DECLARE
+  v_secret text;
+  v_base   text;
+  v_req    bigint;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.live_test_due_pushes()) THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT decrypted_secret INTO v_secret FROM vault.decrypted_secrets WHERE name = 'bike_sync_webhook_secret' LIMIT 1;
+  IF v_secret IS NULL THEN
+    RAISE WARNING '[live_test_tick] Vault secret "bike_sync_webhook_secret" not found — push skipped';
+    RETURN NULL;
+  END IF;
+  SELECT decrypted_secret INTO v_base FROM vault.decrypted_secrets WHERE name = 'bike_sync_base_url' LIMIT 1;
+  v_base := COALESCE(v_base, 'https://xlfkdumbsflqxpezolhl.supabase.co');
+
+  SELECT net.http_post(
+    url     := v_base || '/functions/v1/live-test-push',
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-webhook-secret', v_secret),
+    body    := '{}'::jsonb,
+    timeout_milliseconds := 30000
+  ) INTO v_req;
+  RETURN v_req;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."live_test_tick"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."live_test_tick"() IS 'pg_cron live-test-tick (every 5 min): calls the live-test-push edge function only when live_test_due_pushes() has rows.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."lookup_auth_user"("p_email" "text") RETURNS TABLE("user_id" "uuid", "has_profile" boolean)
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -1928,6 +2014,38 @@ $$;
 ALTER FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."prune_maintenance"("cache_keep_days" integer DEFAULT 7, "history_keep_days" integer DEFAULT 14) RETURNS "jsonb"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  cache_rows   bigint;
+  history_rows bigint;
+BEGIN
+  -- Finished runs only: a running sync still reads its cache.
+  DELETE FROM public.sync_run_cache c
+  USING public.sync_runs r
+  WHERE r.id = c.run_id
+    AND r.status <> 'running'
+    AND r.started_at < now() - make_interval(days => cache_keep_days);
+  GET DIAGNOSTICS cache_rows = ROW_COUNT;
+
+  DELETE FROM cron.job_run_details
+  WHERE start_time < now() - make_interval(days => history_keep_days);
+  GET DIAGNOSTICS history_rows = ROW_COUNT;
+
+  RETURN jsonb_build_object('sync_run_cache', cache_rows, 'cron_history', history_rows);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) IS 'Deletes sync_run_cache of finished runs older than cache_keep_days and cron.job_run_details older than history_keep_days. Run daily by the db-maintenance-prune cron job.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."refresh_company_co2_stats"("p_period" "date" DEFAULT ("date_trunc"('week'::"text", "now"()))::"date", "p_company_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -2267,6 +2385,9 @@ BEGIN
       NEW.contract_declined_at        := NULL;
       NEW.delivered_at                := NULL;
       NEW.copilot_stopped_at          := NULL;
+      NEW.live_test_booked_push_at    := NULL;
+      NEW.live_test_today_push_at     := NULL;
+      NEW.live_test_confirm_push_at   := NULL;
       NEW.contract_status             := NULL;
       NEW.employee_full_price         := NULL;
       NEW.employee_monthly_price      := NULL;
@@ -2496,6 +2617,7 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "copilot_stop_after_commit" boolean DEFAULT false NOT NULL,
     "live_test_at" timestamp with time zone,
     "live_test_confirm_offset_min" integer DEFAULT 15 NOT NULL,
+    "live_test_reminder_offset_min" integer DEFAULT 15 NOT NULL,
     CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text"))),
     CONSTRAINT "companies_sso_kind_check" CHECK (("sso_kind" = ANY (ARRAY['none'::"text", 'google_oidc'::"text", 'microsoft_oidc'::"text", 'saml'::"text"])))
 );
@@ -2557,6 +2679,10 @@ COMMENT ON COLUMN "public"."companies"."live_test_at" IS 'Copilot: the company''
 
 
 COMMENT ON COLUMN "public"."companies"."live_test_confirm_offset_min" IS 'Copilot: minutes after live_test_at before the employee can confirm the test.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."live_test_reminder_offset_min" IS 'Copilot: minutes after live_test_at before the "confirm your test" push.';
 
 
 
@@ -4613,6 +4739,16 @@ GRANT ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_re
 
 
 
+REVOKE ALL ON FUNCTION "public"."live_test_due_pushes"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."live_test_due_pushes"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."live_test_tick"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."live_test_tick"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."lookup_auth_user"("p_email" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."lookup_auth_user"("p_email" "text") TO "service_role";
 
@@ -4659,6 +4795,11 @@ GRANT ALL ON FUNCTION "public"."metrics_seed_on_company_insert"() TO "service_ro
 GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) TO "service_role";
 
 
 

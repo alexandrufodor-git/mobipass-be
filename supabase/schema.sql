@@ -633,6 +633,122 @@ $$;
 ALTER FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "bike_id" "uuid",
+    "live_test_location" "text",
+    "live_test_sent_at" timestamp with time zone,
+    "live_test_checked_in_at" timestamp with time zone,
+    "committed_at" timestamp with time zone,
+    "checked_in_at" timestamp with time zone,
+    "contract_requested_at" timestamp with time zone,
+    "delivered_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "live_test_location_name" "text",
+    "benefit_status" "public"."benefit_status",
+    "contract_status" "public"."contract_status",
+    "contract_viewed_at" timestamp with time zone,
+    "contract_employee_signed_at" timestamp with time zone,
+    "contract_employer_signed_at" timestamp with time zone,
+    "contract_approved_at" timestamp with time zone,
+    "contract_terminated_at" timestamp with time zone,
+    "benefit_terminated_at" timestamp with time zone,
+    "benefit_insurance_claim_at" timestamp with time zone,
+    "step" "public"."bike_benefit_step",
+    "employee_currency" "public"."currency_type",
+    "employee_full_price" numeric(10,2),
+    "employee_monthly_price" numeric(10,2),
+    "employee_contract_months" integer,
+    "contract_declined_at" timestamp with time zone,
+    "live_test_lat" double precision,
+    "live_test_lon" double precision,
+    "prior_commute_mode" "text",
+    "copilot_stopped_at" timestamp with time zone,
+    CONSTRAINT "bike_benefits_prior_commute_mode_check" CHECK ((("prior_commute_mode" IS NULL) OR ("prior_commute_mode" = ANY (ARRAY['car'::"text", 'public_transit'::"text", 'bike'::"text", 'walk'::"text", 'motorcycle'::"text", 'other'::"text", 'unknown'::"text"]))))
+);
+
+
+ALTER TABLE "public"."bike_benefits" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_sent_at" IS 'When the employee tapped "Interested in a bike test" (step 2). NULL = test skipped or not yet requested.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_location_name" IS 'Human-readable name of the test location (e.g., "Maros Bike Cluj")';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."benefit_status" IS 'Overall benefit status for HR view. Auto-updated by triggers. NULL when employee has not started the benefit process yet.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_status" IS 'Contract signing workflow status. Updated manually or via triggers.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_viewed_at" IS 'Timestamp when employee first viewed the contract';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_employee_signed_at" IS 'Timestamp when employee signed the contract';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_employer_signed_at" IS 'Timestamp when employer signed the contract';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_approved_at" IS 'Timestamp when contract was fully approved (both parties signed)';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_terminated_at" IS 'Timestamp when contract was terminated';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."benefit_terminated_at" IS 'Timestamp when benefit was terminated';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."benefit_insurance_claim_at" IS 'Timestamp when insurance claim was filed';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."step" IS 'Current step in the bike benefit workflow. NULL when benefit not yet started.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."employee_currency" IS 'Currency locked for this employee at benefit creation. NULL for legacy records — falls back to companies.currency in views.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."employee_full_price" IS 'Total discounted price: GREATEST(0, full_price - (monthly_subsidy x contract_months)). Computed and stored when step transitions to commit_to_bike. Cleared on choose_bike reset.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."employee_monthly_price" IS 'Monthly employee payment: employee_full_price / contract_months. Computed and stored when step transitions to commit_to_bike. Cleared on choose_bike reset.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."employee_contract_months" IS 'Contract duration (months) locked for this employee at benefit creation. Re-confirmed and stored when step transitions to commit_to_bike. Cleared on choose_bike reset. NULL for legacy records.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."contract_declined_at" IS 'Set by webhook when the employee declines the contract (signer-declined event). Drives contract_status → declined_by_employee via trigger.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."prior_commute_mode" IS 'Rider''s commute mode before the e-bike, captured once at onboarding. Used to qualify the CSRD avoided-emissions baseline. NULL = unknown → v1 aggregation assumes the average-car baseline.';
+
+
+
+COMMENT ON COLUMN "public"."bike_benefits"."copilot_stopped_at" IS 'When the employee committed while their company had copilot_stop_after_commit on. Cleared on reset to choose_bike.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."copilot"("public"."bike_benefits") RETURNS "jsonb"
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public'
@@ -1887,107 +2003,6 @@ ALTER FUNCTION "public"."refresh_company_ledger"() OWNER TO "postgres";
 
 COMMENT ON FUNCTION "public"."refresh_company_ledger"() IS 'Idempotent upsert of the current ISO week''s company_ledger row from company_metrics (one row/company/week, re-stamped daily, frozen on rollover). Daily pg_cron job company-ledger-refresh. See llm-agent-assist/plans/company-metrics-dashboard.md.';
 
-CREATE OR REPLACE FUNCTION "public"."prune_maintenance"("cache_keep_days" integer DEFAULT 7, "history_keep_days" integer DEFAULT 14) RETURNS "jsonb"
-    LANGUAGE "plpgsql"
-    SET "search_path" TO 'public'
-    AS $$
-DECLARE
-  cache_rows   bigint;
-  history_rows bigint;
-BEGIN
-  -- Finished runs only: a running sync still reads its cache.
-  DELETE FROM public.sync_run_cache c
-  USING public.sync_runs r
-  WHERE r.id = c.run_id
-    AND r.status <> 'running'
-    AND r.started_at < now() - make_interval(days => cache_keep_days);
-  GET DIAGNOSTICS cache_rows = ROW_COUNT;
-
-  DELETE FROM cron.job_run_details
-  WHERE start_time < now() - make_interval(days => history_keep_days);
-  GET DIAGNOSTICS history_rows = ROW_COUNT;
-
-  RETURN jsonb_build_object('sync_run_cache', cache_rows, 'cron_history', history_rows);
-END;
-$$;
-
-
-ALTER FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) IS 'Deletes sync_run_cache of finished runs older than cache_keep_days and cron.job_run_details older than history_keep_days. Run daily by the db-maintenance-prune cron job.';
-
-
-
-CREATE OR REPLACE FUNCTION public.live_test_due_pushes()
-RETURNS TABLE (benefit_id uuid, user_id uuid, kind text, live_test_time text)
-    LANGUAGE sql STABLE SECURITY DEFINER
-    SET search_path TO 'public'
-    AS $$
-  SELECT b.id, b.user_id, k.kind, to_char(c.live_test_at AT TIME ZONE 'Europe/Bucharest', 'HH24:MI')
-  FROM public.bike_benefits b
-  JOIN public.profiles p  ON p.user_id = b.user_id
-  JOIN public.companies c ON c.id = p.company_id
-  CROSS JOIN LATERAL (VALUES
-    ('today',   b.live_test_today_push_at IS NULL
-                AND (c.live_test_at AT TIME ZONE 'Europe/Bucharest')::date = (now() AT TIME ZONE 'Europe/Bucharest')::date
-                AND (now() AT TIME ZONE 'Europe/Bucharest')::time >= time '08:00'
-                AND now() < c.live_test_at),
-    ('confirm', b.live_test_confirm_push_at IS NULL
-                AND now() >= c.live_test_at + make_interval(mins => c.live_test_reminder_offset_min))
-  ) AS k(kind, due)
-  WHERE c.copilot_stop_after_commit
-    AND c.live_test_at IS NOT NULL
-    AND b.step = 'book_live_test'
-    AND b.live_test_sent_at IS NOT NULL
-    AND b.live_test_checked_in_at IS NULL
-    AND k.due
-$$;
-
-ALTER FUNCTION public.live_test_due_pushes() OWNER TO postgres;
-
-COMMENT ON FUNCTION public.live_test_due_pushes() IS
-  'Copilot reminders due now: kind today (08:00 Bucharest on the test day, before the test) or confirm (live_test_at + live_test_reminder_offset_min, test not confirmed). Read by live_test_tick() and the live-test-push edge function.';
-
--- Cheap no-op unless someone is due; then one fire-and-forget call to live-test-push.
--- Same Vault secrets as bike_sync_invoke(): the webhook secret and the base URL.
-CREATE OR REPLACE FUNCTION public.live_test_tick() RETURNS bigint
-    LANGUAGE plpgsql SECURITY DEFINER
-    SET search_path TO 'public', 'net', 'vault'
-    AS $$
-DECLARE
-  v_secret text;
-  v_base   text;
-  v_req    bigint;
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM public.live_test_due_pushes()) THEN
-    RETURN NULL;
-  END IF;
-
-  SELECT decrypted_secret INTO v_secret FROM vault.decrypted_secrets WHERE name = 'bike_sync_webhook_secret' LIMIT 1;
-  IF v_secret IS NULL THEN
-    RAISE WARNING '[live_test_tick] Vault secret "bike_sync_webhook_secret" not found — push skipped';
-    RETURN NULL;
-  END IF;
-  SELECT decrypted_secret INTO v_base FROM vault.decrypted_secrets WHERE name = 'bike_sync_base_url' LIMIT 1;
-  v_base := COALESCE(v_base, 'https://xlfkdumbsflqxpezolhl.supabase.co');
-
-  SELECT net.http_post(
-    url     := v_base || '/functions/v1/live-test-push',
-    headers := jsonb_build_object('Content-Type', 'application/json', 'x-webhook-secret', v_secret),
-    body    := '{}'::jsonb,
-    timeout_milliseconds := 30000
-  ) INTO v_req;
-  RETURN v_req;
-END;
-$$;
-
-ALTER FUNCTION public.live_test_tick() OWNER TO postgres;
-
-COMMENT ON FUNCTION public.live_test_tick() IS
-  'pg_cron live-test-tick (every 5 min): calls the live-test-push edge function only when live_test_due_pushes() has rows.';
-
-
 
 
 CREATE OR REPLACE FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS "void"
@@ -2252,9 +2267,6 @@ BEGIN
       NEW.contract_declined_at        := NULL;
       NEW.delivered_at                := NULL;
       NEW.copilot_stopped_at          := NULL;
-      NEW.live_test_booked_push_at    := NULL;
-      NEW.live_test_today_push_at     := NULL;
-      NEW.live_test_confirm_push_at   := NULL;
       NEW.contract_status             := NULL;
       NEW.employee_full_price         := NULL;
       NEW.employee_monthly_price      := NULL;
@@ -2381,121 +2393,6 @@ $$;
 ALTER FUNCTION "public"."update_updated_at_column"() OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "user_id" "uuid" NOT NULL,
-    "bike_id" "uuid",
-    "live_test_location" "text",
-    "live_test_sent_at" timestamp with time zone,
-    "live_test_checked_in_at" timestamp with time zone,
-    "committed_at" timestamp with time zone,
-    "checked_in_at" timestamp with time zone,
-    "contract_requested_at" timestamp with time zone,
-    "delivered_at" timestamp with time zone,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "live_test_location_name" "text",
-    "benefit_status" "public"."benefit_status",
-    "contract_status" "public"."contract_status",
-    "contract_viewed_at" timestamp with time zone,
-    "contract_employee_signed_at" timestamp with time zone,
-    "contract_employer_signed_at" timestamp with time zone,
-    "contract_approved_at" timestamp with time zone,
-    "contract_terminated_at" timestamp with time zone,
-    "benefit_terminated_at" timestamp with time zone,
-    "benefit_insurance_claim_at" timestamp with time zone,
-    "step" "public"."bike_benefit_step",
-    "employee_currency" "public"."currency_type",
-    "employee_full_price" numeric(10,2),
-    "employee_monthly_price" numeric(10,2),
-    "employee_contract_months" integer,
-    "contract_declined_at" timestamp with time zone,
-    "copilot_stopped_at" timestamp with time zone,
-    "live_test_booked_push_at" timestamp with time zone,
-    "live_test_today_push_at" timestamp with time zone,
-    "live_test_confirm_push_at" timestamp with time zone,
-    "live_test_lat" double precision,
-    "live_test_lon" double precision,
-    "prior_commute_mode" "text",
-    CONSTRAINT "bike_benefits_prior_commute_mode_check" CHECK ((("prior_commute_mode" IS NULL) OR ("prior_commute_mode" = ANY (ARRAY['car'::"text", 'public_transit'::"text", 'bike'::"text", 'walk'::"text", 'motorcycle'::"text", 'other'::"text", 'unknown'::"text"]))))
-);
-
-
-ALTER TABLE "public"."bike_benefits" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."live_test_location_name" IS 'Human-readable name of the test location (e.g., "Maros Bike Cluj")';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."live_test_sent_at" IS 'When the employee tapped "Interested in a bike test" (step 2). NULL = test skipped or not yet requested.';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."benefit_status" IS 'Overall benefit status for HR view. Auto-updated by triggers. NULL when employee has not started the benefit process yet.';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."contract_status" IS 'Contract signing workflow status. Updated manually or via triggers.';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."contract_viewed_at" IS 'Timestamp when employee first viewed the contract';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."contract_employee_signed_at" IS 'Timestamp when employee signed the contract';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."contract_employer_signed_at" IS 'Timestamp when employer signed the contract';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."contract_approved_at" IS 'Timestamp when contract was fully approved (both parties signed)';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."contract_terminated_at" IS 'Timestamp when contract was terminated';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."benefit_terminated_at" IS 'Timestamp when benefit was terminated';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."benefit_insurance_claim_at" IS 'Timestamp when insurance claim was filed';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."step" IS 'Current step in the bike benefit workflow. NULL when benefit not yet started.';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."employee_currency" IS 'Currency locked for this employee at benefit creation. NULL for legacy records — falls back to companies.currency in views.';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."employee_full_price" IS 'Total discounted price: GREATEST(0, full_price - (monthly_subsidy x contract_months)). Computed and stored when step transitions to commit_to_bike. Cleared on choose_bike reset.';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."employee_monthly_price" IS 'Monthly employee payment: employee_full_price / contract_months. Computed and stored when step transitions to commit_to_bike. Cleared on choose_bike reset.';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."employee_contract_months" IS 'Contract duration (months) locked for this employee at benefit creation. Re-confirmed and stored when step transitions to commit_to_bike. Cleared on choose_bike reset. NULL for legacy records.';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."contract_declined_at" IS 'Set by webhook when the employee declines the contract (signer-declined event). Drives contract_status → declined_by_employee via trigger.';
-
-
-
-COMMENT ON COLUMN "public"."bike_benefits"."prior_commute_mode" IS 'Rider''s commute mode before the e-bike, captured once at onboarding. Used to qualify the CSRD avoided-emissions baseline. NULL = unknown → v1 aggregation assumes the average-car baseline.';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."bike_models" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "dealer_id" "uuid" NOT NULL,
@@ -2599,7 +2496,6 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "copilot_stop_after_commit" boolean DEFAULT false NOT NULL,
     "live_test_at" timestamp with time zone,
     "live_test_confirm_offset_min" integer DEFAULT 15 NOT NULL,
-    "live_test_reminder_offset_min" integer DEFAULT 15 NOT NULL,
     CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text"))),
     CONSTRAINT "companies_sso_kind_check" CHECK (("sso_kind" = ANY (ARRAY['none'::"text", 'google_oidc'::"text", 'microsoft_oidc'::"text", 'saml'::"text"])))
 );
@@ -2649,6 +2545,18 @@ COMMENT ON COLUMN "public"."companies"."sso_hd_required" IS 'When true, the Goog
 
 
 COMMENT ON COLUMN "public"."companies"."sso_config" IS 'Provider-specific config. Microsoft-ready keys: { tenant_id?, issuer?, email_claim?, attribute_map?, client_id_override? }. Company resolution = tenant assertion first (tid/issuer), email_domain second. Empty {} = defaults.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."copilot_stop_after_commit" IS 'Copilot: committing keeps the employee on commit_to_bike instead of moving to sign_contract.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."live_test_at" IS 'Copilot: the company''s single test-ride date and hour. Set directly in the DB for now.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."live_test_confirm_offset_min" IS 'Copilot: minutes after live_test_at before the employee can confirm the test.';
 
 
 
@@ -4476,20 +4384,17 @@ GRANT ALL ON FUNCTION "public"."authorize"("requested_permission" "public"."user
 
 
 
-GRANT ALL ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."bike_sync_kickoff"("p_mode" "text", "p_categories" "text"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."bike_sync_kickoff"("p_mode" "text", "p_categories" "text"[]) TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."bike_sync_kickoff"("p_mode" "text", "p_categories" "text"[]) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."bike_sync_kickoff"("p_mode" "text", "p_categories" "text"[]) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."bike_sync_tick"() TO "anon";
-GRANT ALL ON FUNCTION "public"."bike_sync_tick"() TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."bike_sync_tick"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."bike_sync_tick"() TO "service_role";
 
 
@@ -4512,8 +4417,7 @@ GRANT ALL ON TABLE "public"."sync_units" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) TO "anon";
-GRANT ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."claim_next_sync_unit"("p_run_id" "uuid", "p_branch" "text", "p_lease_seconds" integer) TO "service_role";
 
 
@@ -4525,12 +4429,18 @@ GRANT ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() TO "service_rol
 
 
 
-GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."bike_benefits" TO "anon";
+GRANT ALL ON TABLE "public"."bike_benefits" TO "authenticated";
+GRANT ALL ON TABLE "public"."bike_benefits" TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."copilot"("public"."bike_benefits") TO "anon";
 GRANT ALL ON FUNCTION "public"."copilot"("public"."bike_benefits") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."copilot"("public"."bike_benefits") TO "service_role";
 
@@ -4555,8 +4465,7 @@ GRANT ALL ON FUNCTION "public"."enforce_email_matches_company_domain"() TO "serv
 
 
 
-GRANT ALL ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) TO "anon";
-GRANT ALL ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) TO "service_role";
 
 
@@ -4567,8 +4476,7 @@ GRANT ALL ON TABLE "public"."sync_runs" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."finalize_sync_run"("p_run_id" "uuid") TO "service_role";
 
 
@@ -4598,8 +4506,7 @@ GRANT ALL ON FUNCTION "public"."get_my_role"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_vault_secret"("secret_name" "text") TO "service_role";
 
 
@@ -4701,8 +4608,7 @@ GRANT ALL ON FUNCTION "public"."handle_user_registration"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") TO "service_role";
 
 
@@ -4712,14 +4618,12 @@ GRANT ALL ON FUNCTION "public"."lookup_auth_user"("p_email" "text") TO "service_
 
 
 
-GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."match_pending_invite"("p_company_id" "uuid", "p_dob_hash" "text", "p_first_norm" "text", "p_last_norm" "text", "p_email_lower" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."merge_bike_offers"("p_dealer_id" "uuid", "p_models" "jsonb") TO "service_role";
 
 
@@ -4759,49 +4663,26 @@ GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invit
 
 
 REVOKE ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) TO "service_role";
 
 
 
-REVOKE ALL ON FUNCTION "public"."live_test_due_pushes"() FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."live_test_due_pushes"() TO "service_role";
-
-
-
-REVOKE ALL ON FUNCTION "public"."live_test_tick"() FROM PUBLIC;
-
-
-
-REVOKE ALL ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) TO "service_role";
-
-
-
 REVOKE ALL ON FUNCTION "public"."refresh_company_ledger"() FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."refresh_company_ledger"() TO "anon";
-GRANT ALL ON FUNCTION "public"."refresh_company_ledger"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."refresh_company_ledger"() TO "service_role";
 
 
 
 REVOKE ALL ON FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[]) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uuid"[]) TO "service_role";
 
 
 
 REVOKE ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") TO "service_role";
 
 
@@ -4978,12 +4859,6 @@ GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "service_
 
 
 
-
-
-
-GRANT ALL ON TABLE "public"."bike_benefits" TO "anon";
-GRANT ALL ON TABLE "public"."bike_benefits" TO "authenticated";
-GRANT ALL ON TABLE "public"."bike_benefits" TO "service_role";
 
 
 

@@ -633,6 +633,33 @@ $$;
 ALTER FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."copilot"("public"."bike_benefits") RETURNS "jsonb"
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $_$
+  SELECT jsonb_build_object(
+    'enabled',          c.copilot_stop_after_commit,
+    'live_test_at',     c.live_test_at,
+    'live_test_label',  to_char(c.live_test_at AT TIME ZONE 'Europe/Bucharest', 'Dy, FMDD Mon · HH24:MI'),
+    'test_confirmable', c.live_test_at IS NOT NULL
+                        AND now() >= c.live_test_at + make_interval(mins => c.live_test_confirm_offset_min),
+    'locked',           c.copilot_stop_after_commit
+                        AND ($1.live_test_sent_at IS NOT NULL
+                             OR $1.step IN ('commit_to_bike', 'sign_contract', 'pickup_delivery'))
+  )
+  FROM public.profiles p
+  JOIN public.companies c ON c.id = p.company_id
+  WHERE p.user_id = $1.user_id
+$_$;
+
+
+ALTER FUNCTION "public"."copilot"("public"."bike_benefits") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."copilot"("public"."bike_benefits") IS 'Copilot state for a benefit: enabled, test date + label (Europe/Bucharest), whether the test can be confirmed yet, and whether the bike choice is locked.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."current_user_has_password"() RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO ''
@@ -2123,6 +2150,7 @@ BEGIN
       NEW.contract_approved_at        := NULL;
       NEW.contract_declined_at        := NULL;
       NEW.delivered_at                := NULL;
+      NEW.copilot_stopped_at          := NULL;
       NEW.contract_status             := NULL;
       NEW.employee_full_price         := NULL;
       NEW.employee_monthly_price      := NULL;
@@ -2278,6 +2306,7 @@ CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
     "employee_monthly_price" numeric(10,2),
     "employee_contract_months" integer,
     "contract_declined_at" timestamp with time zone,
+    "copilot_stopped_at" timestamp with time zone,
     "live_test_lat" double precision,
     "live_test_lon" double precision,
     "prior_commute_mode" "text",
@@ -2460,6 +2489,9 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "sso_kind" "text" DEFAULT 'none'::"text" NOT NULL,
     "sso_hd_required" boolean DEFAULT true NOT NULL,
     "sso_config" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "copilot_stop_after_commit" boolean DEFAULT false NOT NULL,
+    "live_test_at" timestamp with time zone,
+    "live_test_confirm_offset_min" integer DEFAULT 15 NOT NULL,
     CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text"))),
     CONSTRAINT "companies_sso_kind_check" CHECK (("sso_kind" = ANY (ARRAY['none'::"text", 'google_oidc'::"text", 'microsoft_oidc'::"text", 'saml'::"text"])))
 );
@@ -3860,15 +3892,7 @@ CREATE POLICY "Users can read own role" ON "public"."user_roles" FOR SELECT TO "
 ALTER TABLE "public"."bike_benefits" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "bike_benefits_employee_insert" ON "public"."bike_benefits" FOR INSERT TO "authenticated" WITH CHECK (("user_id" = "auth"."uid"()));
-
-
-
 CREATE POLICY "bike_benefits_employee_select" ON "public"."bike_benefits" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
-
-
-
-CREATE POLICY "bike_benefits_employee_update" ON "public"."bike_benefits" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
 
 
 
@@ -4396,6 +4420,11 @@ GRANT ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() TO "service_rol
 GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer, "p_n_inserted" integer, "p_n_updated" integer, "p_n_models" integer, "p_n_failed" integer, "p_error" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."copilot"("public"."bike_benefits") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."copilot"("public"."bike_benefits") TO "service_role";
 
 
 

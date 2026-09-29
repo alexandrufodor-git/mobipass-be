@@ -444,6 +444,12 @@ verify_jwt = true
 import_map = "./functions/send-contract/deno.json"
 entrypoint = "./functions/send-contract/index.ts"
 
+[functions.onboarding-action]
+enabled = true
+verify_jwt = true
+import_map = "./functions/onboarding-action/deno.json"
+entrypoint = "./functions/onboarding-action/index.ts"
+
 [functions.esignatures-webhook]
 enabled = true
 verify_jwt = false

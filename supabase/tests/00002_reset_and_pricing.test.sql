@@ -82,7 +82,8 @@ BEGIN
       contract_employer_signed_at = now(),
       contract_approved_at        = now(),
       contract_declined_at        = now(),
-      delivered_at                = now()
+      delivered_at                = now(),
+      copilot_stopped_at          = now()
   WHERE id = v_bb;
 
   -- Create a bike_order for this benefit
@@ -97,7 +98,7 @@ BEGIN
 END;
 $$;
 
-SELECT plan(17);
+SELECT plan(18);
 
 -- ── T-pre: onboarding_status should be true after delivery (set in fixture) ──
 SELECT ok(
@@ -122,6 +123,12 @@ SELECT ok(
 SELECT ok(
   (SELECT committed_at IS NULL FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix02)),
   'T02: reset clears committed_at'
+);
+
+-- T02b: copilot_stopped_at cleared
+SELECT ok(
+  (SELECT copilot_stopped_at IS NULL FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix02)),
+  'T02b: reset clears copilot_stopped_at'
 );
 
 -- T03: contract_requested_at cleared

@@ -15,6 +15,7 @@ import type { EmailPatternKind } from "../_shared/emailPattern.ts"
  * Request: POST with X-E2E-Secret header.
  *   Body: { command: "bootstrap" }
  *         { command: "reset", flow: "<flow-name>" }
+ *         { command: "copilot_test_due" }  — mid-flow: test day 15 min ago, confirm unlocked
  *
  * Vault secrets (set via scripts/setup-e2e-vault.sh for local, or SQL on prod):
  *   e2e_secret            — required shared secret (matches X-E2E-Secret header)
@@ -88,6 +89,7 @@ const E2E_PII_SALARY_GROSS  = 6000
 type FlowTarget =
   | "reges_pending"
   | "fresh"
+  | "fresh_copilot"
   | "pickup_ready_no_address"
   | "completed_no_address"
   | "completed_with_address"
@@ -97,6 +99,7 @@ const FLOWS: Record<string, FlowTarget> = {
   "reges-claim-register":            "reges_pending",
   "reges-claim-bad-email":           "reges_pending",
   "onboarding-1-to-4":               "fresh",
+  "onboarding-copilot":              "fresh_copilot",
   "onboarding-step-5":               "pickup_ready_no_address",
   "onboarding-step-5-to-dashboard":  "pickup_ready_no_address",
   "address-to-dashboard":            "completed_no_address",
@@ -504,6 +507,13 @@ async function resetToCompleted(userId: string, companyId: string, withAddress: 
 async function applyTarget(target: FlowTarget, companyId: string): Promise<void> {
   await deleteAccount(companyId)
   await seedRegesStaged(companyId)
+  // Company-wide copilot settings: every target sets them so a copilot run can't
+  // leak into the next flow. Test day is tomorrow (confirm locked); copilotTestDue() unlocks it.
+  const copilot = target === "fresh_copilot"
+  await patch("companies", `id=eq.${companyId}`, {
+    copilot_stop_after_commit: copilot,
+    live_test_at: copilot ? new Date(Date.now() + 24 * 3_600_000).toISOString() : null,
+  })
   // reges_pending stops here — staged invite + PII, no auth user — so the
   // Maestro register flow performs the real claim + OTP signup itself.
   if (target === "reges_pending") return
@@ -512,7 +522,8 @@ async function applyTarget(target: FlowTarget, companyId: string): Promise<void>
   // Every registered E2E state holds hr+employee (multi-role use case).
   await grantHrRole(uid)
   switch (target) {
-    case "fresh":                    await resetToFresh(uid); break
+    case "fresh":
+    case "fresh_copilot":            await resetToFresh(uid); break
     case "pickup_ready_no_address":  await resetToPickupReadyNoAddress(uid, companyId); break
     case "completed_no_address":     await resetToCompleted(uid, companyId, false); break
     case "completed_with_address":   await resetToCompleted(uid, companyId, true); break
@@ -536,6 +547,13 @@ async function reset(flowName: string): Promise<Record<string, unknown>> {
   const companyId = await ensureCompany()
   await applyTarget(target, companyId)
   return { ok: true, flow: flowName, target, account: ACCOUNT_EMAIL }
+}
+
+async function copilotTestDue(): Promise<Record<string, unknown>> {
+  const companyId = await ensureCompany()
+  const liveTestAt = new Date(Date.now() - 15 * 60_000).toISOString()
+  await patch("companies", `id=eq.${companyId}`, { live_test_at: liveTestAt, live_test_confirm_offset_min: 15 })
+  return { ok: true, live_test_at: liveTestAt }
 }
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
@@ -570,7 +588,10 @@ Deno.serve(async (req) => {
       if (!body.flow) return json({ error: "flow_required" }, 400)
       return json(await reset(body.flow))
     }
-    return json({ error: "unknown_command", known: ["bootstrap", "reset"] }, 400)
+    if (body.command === "copilot_test_due") {
+      return json(await copilotTestDue())
+    }
+    return json({ error: "unknown_command", known: ["bootstrap", "reset", "copilot_test_due"] }, 400)
   } catch (err) {
     console.error("[e2e-seed] error:", err)
     return json({ error: "internal_error", message: (err as Error).message }, 500)

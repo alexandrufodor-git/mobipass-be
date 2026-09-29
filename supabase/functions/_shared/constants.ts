@@ -97,6 +97,12 @@ export const Errors = {
   CONTRACT_ALREADY_REQUESTED: { error: "contract_already_requested" },
   INVALID_BENEFIT_STEP: { error: "invalid_benefit_step", reason: "step_must_be_sign_contract" },
   ESIGNATURES_API_FAILED: { error: "esignatures_api_failed" },
+  // Onboarding actions
+  UNKNOWN_ACTION: { error: "unknown_action" },
+  BIKE_ID_REQUIRED: { error: "bike_id_required" },
+  BENEFIT_WRITE_FAILED: { error: "benefit_write_failed" },
+  COPILOT_LOCKED: { error: "copilot_locked", reason: "bike_choice_locked_in_copilot" },
+  TEST_NOT_CONFIRMABLE: { error: "test_not_confirmable" },
   // Notification errors (non-fatal, logged only)
   FCM_SEND_FAILED: { error: "fcm_send_failed" },
   BROADCAST_FAILED: { error: "broadcast_failed" },

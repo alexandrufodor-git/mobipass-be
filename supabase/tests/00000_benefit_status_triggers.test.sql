@@ -63,7 +63,7 @@ BEGIN
 END;
 $$;
 
-SELECT plan(16);
+SELECT plan(18);
 
 -- ── T01: INSERT with step=NULL → inactive ────────────────────
 SELECT is(
@@ -108,15 +108,15 @@ SELECT is(
   'T05: step=book_live_test → searching'
 );
 
--- ── T06: set live_test_sent_at while on book_live_test → still searching
+-- ── T06: set live_test_sent_at while on book_live_test (test_interest) → testing
 UPDATE public.bike_benefits
 SET live_test_sent_at = now()
 WHERE id = (SELECT benefit_id FROM _fix00);
 
 SELECT is(
   (SELECT benefit_status::text FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix00)),
-  'searching',
-  'T06: book_live_test + whatsapp set → still searching'
+  'testing',
+  'T06: book_live_test + live_test_sent_at → testing'
 );
 
 -- ── T07: step=commit_to_bike (whatsapp already set) → testing ─
@@ -130,15 +130,15 @@ SELECT is(
   'T07: step=commit_to_bike with whatsapp → testing'
 );
 
--- ── T08: set committed_at while on commit_to_bike → stays testing
+-- ── T08: set committed_at while on commit_to_bike (copilot commit) → active
 UPDATE public.bike_benefits
 SET committed_at = now()
 WHERE id = (SELECT benefit_id FROM _fix00);
 
 SELECT is(
   (SELECT benefit_status::text FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix00)),
-  'testing',
-  'T08: setting committed_at on commit_to_bike does not change testing status'
+  'active',
+  'T08: commit_to_bike + committed_at → active'
 );
 
 -- ── T09: step=sign_contract (committed_at set) → active ──────
@@ -217,6 +217,28 @@ SELECT is(
   (SELECT benefit_status::text FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix00)),
   'testing',
   'T15: sign_contract without committed_at → keeps OLD benefit_status (testing)'
+);
+
+-- ── T17: third pass — commit_from_details (no test), then commit → active
+UPDATE public.bike_benefits SET step = 'choose_bike'
+WHERE id = (SELECT benefit_id FROM _fix00);
+UPDATE public.bike_benefits SET step = 'commit_to_bike'
+WHERE id = (SELECT benefit_id FROM _fix00);
+
+SELECT is(
+  (SELECT benefit_status::text FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix00)),
+  'searching',
+  'T17: commit_to_bike without test → searching'
+);
+
+-- ── T18: committed_at on commit_to_bike without test → active
+UPDATE public.bike_benefits SET committed_at = now()
+WHERE id = (SELECT benefit_id FROM _fix00);
+
+SELECT is(
+  (SELECT benefit_status::text FROM public.bike_benefits WHERE id = (SELECT benefit_id FROM _fix00)),
+  'active',
+  'T18: commit_to_bike + committed_at (no test) → active'
 );
 
 -- ── T16: INSERT with step=pickup_delivery and no OLD → defaults to active ─

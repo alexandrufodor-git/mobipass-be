@@ -2400,7 +2400,11 @@ BEGIN
     NEW.benefit_status := 'searching'::public.benefit_status;
 
   ELSIF NEW.step = 'book_live_test'::public.bike_benefit_step THEN
-    NEW.benefit_status := 'searching'::public.benefit_status;
+    IF NEW.live_test_sent_at IS NOT NULL THEN
+      NEW.benefit_status := 'testing'::public.benefit_status;
+    ELSE
+      NEW.benefit_status := 'searching'::public.benefit_status;
+    END IF;
 
   ELSIF NEW.step = 'commit_to_bike'::public.bike_benefit_step THEN
     IF NEW.bike_id IS NOT NULL THEN
@@ -2414,7 +2418,9 @@ BEGIN
       WHERE  b.id = NEW.bike_id;
     END IF;
 
-    IF NEW.live_test_sent_at IS NOT NULL THEN
+    IF NEW.committed_at IS NOT NULL THEN
+      NEW.benefit_status := 'active'::public.benefit_status;
+    ELSIF NEW.live_test_sent_at IS NOT NULL THEN
       NEW.benefit_status := 'testing'::public.benefit_status;
     ELSE
       NEW.benefit_status := 'searching'::public.benefit_status;

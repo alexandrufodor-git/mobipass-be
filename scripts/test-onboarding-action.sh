@@ -89,16 +89,15 @@ check "test_interest with no benefit → 400" "400" "$(call '{"action":"test_int
 echo
 echo "═══ Walk: copilot off ═══"
 check "start (creates benefit) → 200" "200" "$(call '{"action":"start"}')"
-check "  step" "choose_bike" "$(row step)"
+check "  step, status searching" "choose_bike|searching" "$(row "step || '|' || benefit_status")"
 check "  response has bike join key" "true" "$(python3 -c 'import json;print(str("bike" in json.load(open("/tmp/onbact.json"))).lower())')"
 check "choose_bike_for_test → 200" "200" "$(call "$CHOOSE_BODY")"
 check "  step, bike" "book_live_test|${BIKE_ID}" "$(row "step || '|' || bike_id")"
 check "test_interest → 200" "200" "$(call '{"action":"test_interest"}')"
-check "  step unchanged, live_test_sent_at set" "book_live_test|true" "$(row "step || '|' || (live_test_sent_at IS NOT NULL)")"
-check "commit_from_details → 200" "200" "$(call "$COMMIT_DETAILS_BODY")"
-check "  step, no committed_at, status testing" "commit_to_bike|false|testing" "$(row "step || '|' || (committed_at IS NOT NULL) || '|' || benefit_status")"
-check "commit → 200" "200" "$(call '{"action":"commit"}')"
-check "  step sign_contract, committed, no copilot stamp, active" "sign_contract|true|false|active" "$(row "step || '|' || (committed_at IS NOT NULL) || '|' || (copilot_stopped_at IS NOT NULL) || '|' || benefit_status")"
+check "  step unchanged, live_test_sent_at set, status testing" "book_live_test|true|testing" "$(row "step || '|' || (live_test_sent_at IS NOT NULL) || '|' || benefit_status")"
+check "commit_from_details (commits in one tap) → 200" "200" "$(call "$COMMIT_DETAILS_BODY")"
+check "  step sign_contract, committed, priced, no copilot stamp, active" "sign_contract|true|true|false|active" "$(row "step || '|' || (committed_at IS NOT NULL) || '|' || (employee_full_price IS NOT NULL) || '|' || (copilot_stopped_at IS NOT NULL) || '|' || benefit_status")"
+check "  response is the committed row" "sign_contract|true" "$(python3 -c 'import json;b=json.load(open("/tmp/onbact.json"));print(b["step"]+"|"+str(b["committed_at"] is not None).lower())')"
 check "confirm_pickup → 200" "200" "$(call '{"action":"confirm_pickup"}')"
 check "  delivered_at set" "t" "$(row "delivered_at IS NOT NULL")"
 check "reset → 200" "200" "$(call '{"action":"reset"}')"
@@ -108,9 +107,8 @@ echo
 echo "═══ Walk: copilot on ═══"
 db "UPDATE public.companies SET copilot_stop_after_commit = true WHERE email_domain = '${DOMAIN}'" > /dev/null
 call "$CHOOSE_BODY" > /dev/null
-call "$COMMIT_DETAILS_BODY" > /dev/null
-check "commit → 200" "200" "$(call '{"action":"commit"}')"
-check "  stays commit_to_bike, committed, copilot stamp set" "commit_to_bike|true|true" "$(row "step || '|' || (committed_at IS NOT NULL) || '|' || (copilot_stopped_at IS NOT NULL)")"
+check "commit_from_details (commits in one tap) → 200" "200" "$(call "$COMMIT_DETAILS_BODY")"
+check "  stays commit_to_bike, committed, copilot stamp set, active" "commit_to_bike|true|true|active" "$(row "step || '|' || (committed_at IS NOT NULL) || '|' || (copilot_stopped_at IS NOT NULL) || '|' || benefit_status")"
 check "reset → 200" "200" "$(call '{"action":"reset"}')"
 check "  copilot stamp cleared" "f" "$(row "copilot_stopped_at IS NOT NULL")"
 
@@ -123,15 +121,15 @@ check "  response: locked, label set, not confirmable" "true|true|false" "$(pyth
 check "choose_bike_for_test when locked → 409" "409" "$(call "$CHOOSE_BODY")"
 check "commit_from_details when locked → 409" "409" "$(call "$COMMIT_DETAILS_BODY")"
 check "start (Choose another ebike) when locked → 409" "409" "$(call '{"action":"start"}')"
-check "  still on step 2" "book_live_test" "$(row step)"
+check "  still on step 2, status testing" "book_live_test|testing" "$(row "step || '|' || benefit_status")"
 check "confirm_test before the test → 409" "409" "$(call '{"action":"confirm_test"}')"
 db "UPDATE public.companies SET live_test_at = now() - interval '1 hour' WHERE email_domain = '${DOMAIN}'" > /dev/null
 check "confirm_test after test + offset → 200" "200" "$(call '{"action":"confirm_test"}')"
-check "  step commit_to_bike, checked in" "commit_to_bike|true" "$(row "step || '|' || (live_test_checked_in_at IS NOT NULL)")"
+check "  step commit_to_bike, checked in, status testing" "commit_to_bike|true|testing" "$(row "step || '|' || (live_test_checked_in_at IS NOT NULL) || '|' || benefit_status")"
 check "commit → 200" "200" "$(call '{"action":"commit"}')"
-check "  stays commit_to_bike, copilot stamp set" "commit_to_bike|true" "$(row "step || '|' || (copilot_stopped_at IS NOT NULL)")"
+check "  stays commit_to_bike, copilot stamp set, active" "commit_to_bike|true|active" "$(row "step || '|' || (copilot_stopped_at IS NOT NULL) || '|' || benefit_status")"
 check "reset (allowed when locked) → 200" "200" "$(call '{"action":"reset"}')"
-check "  back to choose_bike, test stamps cleared" "choose_bike|false|false" "$(row "step || '|' || (live_test_sent_at IS NOT NULL) || '|' || (live_test_checked_in_at IS NOT NULL)")"
+check "  back to choose_bike, test stamps cleared, searching" "choose_bike|false|false|searching" "$(row "step || '|' || (live_test_sent_at IS NOT NULL) || '|' || (live_test_checked_in_at IS NOT NULL) || '|' || benefit_status")"
 
 echo
 echo "═══ Isolation ═══"

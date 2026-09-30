@@ -40,6 +40,9 @@ export type Decision = { patch: Patch } | { error: "copilot_locked" | "test_not_
 
 export const ACTIONS_NEEDING_BIKE: readonly Action[] = ["choose_bike_for_test", "commit_from_details"]
 
+// Committing from bike details is the commit itself: the first write lands step 3 so the trigger prices the bike.
+export const FOLLOW_UP: Partial<Record<Action, Action>> = { commit_from_details: "commit" }
+
 // Once the copilot user asked for a test or committed, the bike can't change.
 const LOCKED_ACTIONS: readonly Action[] = ["start", "choose_bike_for_test", "commit_from_details"]
 

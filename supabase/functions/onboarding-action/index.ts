@@ -9,7 +9,7 @@ import { corsResponse } from "../_shared/ioHelpers.ts"
 import { requireJwt, extractUserId } from "../_shared/auth.ts"
 import { makeRestClient } from "../_shared/supabaseRest.ts"
 import { claimAndSendLiveTestPush } from "../_shared/liveTestPush.ts"
-import { ACTIONS_NEEDING_BIKE, ActionBenefit, decide, isAction } from "./actions.ts"
+import { ACTIONS_NEEDING_BIKE, ActionBenefit, FOLLOW_UP, decide, isAction } from "./actions.ts"
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
@@ -75,12 +75,20 @@ Deno.serve(async (req) => {
     }
     if (!benefit) throw badRequest(Errors.NO_BIKE_BENEFIT, undefined, origin)
 
-    const decision = decide(action, benefit, { bike_id: bikeId }, new Date().toISOString())
+    const now = new Date().toISOString()
+    const decision = decide(action, benefit, { bike_id: bikeId }, now)
     if ("error" in decision) {
       throw json(decision.error === "copilot_locked" ? Errors.COPILOT_LOCKED : Errors.TEST_NOT_CONFIRMABLE, 409, origin)
     }
 
-    const res = await writeBenefit("PATCH", `id=eq.${benefit.id}&user_id=eq.${userId}`, decision.patch, origin)
+    const filter = `id=eq.${benefit.id}&user_id=eq.${userId}`
+    let res = await writeBenefit("PATCH", filter, decision.patch, origin)
+
+    const next = FOLLOW_UP[action]
+    if (res.ok && next) {
+      const followUp = decide(next, benefit, {}, now)
+      if ("patch" in followUp) res = await writeBenefit("PATCH", filter, followUp.patch, origin)
+    }
 
     // Copilot: the test date is already set, so the interest tap books it.
     const label = benefit.copilot?.live_test_label

@@ -6,7 +6,7 @@
 // commit, confirm_test, and the copilot lock.
 
 import { assertEquals } from "jsr:@std/assert"
-import { ACTIONS, ActionBenefit, Copilot, decide, isAction } from "./actions.ts"
+import { ACTIONS, ActionBenefit, Copilot, FOLLOW_UP, decide, isAction } from "./actions.ts"
 
 const NOW = "2026-09-29T10:00:00.000Z"
 const BIKE = "11111111-1111-1111-1111-111111111111"
@@ -37,6 +37,10 @@ Deno.test("test_interest → live_test_sent_at only, stays on step 2", () => {
 
 Deno.test("commit_from_details → bike + commit_to_bike, no committed_at", () => {
   assertEquals(decide("commit_from_details", NO_COPILOT, { bike_id: BIKE }, NOW), { patch: { bike_id: BIKE, step: "commit_to_bike" } })
+})
+
+Deno.test("commit_from_details is followed by commit (no second confirmation)", () => {
+  assertEquals(FOLLOW_UP, { commit_from_details: "commit" })
 })
 
 Deno.test("commit, no copilot → committed_at + sign_contract", () => {

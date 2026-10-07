@@ -2023,13 +2023,14 @@ $$;
 ALTER FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invite_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."prune_maintenance"("cache_keep_days" integer DEFAULT 7, "history_keep_days" integer DEFAULT 14) RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."prune_maintenance"("cache_keep_days" integer DEFAULT 7, "history_keep_days" integer DEFAULT 14, "reports_keep_days" integer DEFAULT 14) RETURNS "jsonb"
     LANGUAGE "plpgsql"
     SET "search_path" TO 'public'
     AS $$
 DECLARE
   cache_rows   bigint;
   history_rows bigint;
+  reports_req  bigint;
 BEGIN
   -- Finished runs only: a running sync still reads its cache.
   DELETE FROM public.sync_run_cache c
@@ -2043,15 +2044,26 @@ BEGIN
   WHERE start_time < now() - make_interval(days => history_keep_days);
   GET DIAGNOSTICS history_rows = ROW_COUNT;
 
-  RETURN jsonb_build_object('sync_run_cache', cache_rows, 'cron_history', history_rows);
+  -- A failing reports request must not roll back the two deletes above.
+  BEGIN
+    reports_req := public.request_issue_reports_prune(reports_keep_days);
+  EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'prune_maintenance: issue reports request failed: %', SQLERRM;
+  END;
+
+  RETURN jsonb_build_object(
+    'sync_run_cache', cache_rows,
+    'cron_history', history_rows,
+    'issue_reports_request', reports_req
+  );
 END;
 $$;
 
 
-ALTER FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) OWNER TO "postgres";
+ALTER FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer, "reports_keep_days" integer) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) IS 'Deletes sync_run_cache of finished runs older than cache_keep_days and cron.job_run_details older than history_keep_days. Run daily by the db-maintenance-prune cron job.';
+COMMENT ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer, "reports_keep_days" integer) IS 'Deletes sync_run_cache of finished runs older than cache_keep_days and cron.job_run_details older than history_keep_days; issue_reports older than reports_keep_days go through request_issue_reports_prune(). Run daily by the db-maintenance-prune cron job.';
 
 
 
@@ -2192,6 +2204,44 @@ $$;
 
 
 ALTER FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."request_issue_reports_prune"("keep_days" integer DEFAULT 14) RETURNS bigint
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public', 'net', 'vault'
+    AS $$
+DECLARE
+  v_secret text;
+  v_base   text;
+  v_req    bigint;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.issue_reports WHERE created_at < now() - make_interval(days => keep_days))
+     AND NOT EXISTS (SELECT 1 FROM storage.objects
+                     WHERE bucket_id = 'issue-reports' AND created_at < now() - make_interval(days => keep_days)) THEN
+    RETURN NULL;
+  END IF;
+  SELECT decrypted_secret INTO v_secret FROM vault.decrypted_secrets WHERE name = 'bike_sync_webhook_secret' LIMIT 1;
+  SELECT decrypted_secret INTO v_base FROM vault.decrypted_secrets WHERE name = 'bike_sync_base_url' LIMIT 1;
+  IF v_secret IS NULL OR v_base IS NULL THEN
+    RAISE WARNING 'request_issue_reports_prune: bike_sync_webhook_secret or bike_sync_base_url missing from Vault';
+    RETURN NULL;
+  END IF;
+  SELECT net.http_post(
+    url     := v_base || '/functions/v1/issue-report-prune',
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-webhook-secret', v_secret),
+    body    := jsonb_build_object('keep_days', keep_days),
+    timeout_milliseconds := 60000
+  ) INTO v_req;
+  RETURN v_req;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."request_issue_reports_prune"("keep_days" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."request_issue_reports_prune"("keep_days" integer) IS 'Asks the issue-report-prune edge function to delete reports older than keep_days with their files. Called by prune_maintenance() and scripts/cron-audit.sh reports prune.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") RETURNS "void"
@@ -3042,6 +3092,32 @@ CREATE TABLE IF NOT EXISTS "public"."integration_messages" (
 ALTER TABLE "public"."integration_messages" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."issue_reports" (
+    "id" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "trigger" "text" NOT NULL,
+    "platform" "text" NOT NULL,
+    "app_version" "text" NOT NULL,
+    "build" "text" NOT NULL,
+    "os_version" "text" NOT NULL,
+    "device_model" "text" NOT NULL,
+    "locale" "text",
+    "timezone" "text",
+    "description" "text" DEFAULT ''::"text" NOT NULL,
+    "storage_path" "text" NOT NULL,
+    "size_bytes" integer NOT NULL,
+    CONSTRAINT "issue_reports_platform_check" CHECK (("platform" = ANY (ARRAY['ios'::"text", 'android'::"text"]))),
+    CONSTRAINT "issue_reports_trigger_check" CHECK (("trigger" = ANY (ARRAY['shake'::"text", 'settings'::"text"])))
+);
+
+
+ALTER TABLE "public"."issue_reports" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."issue_reports" IS 'Anonymous mobile problem reports. service_role only; logs zip in bucket issue-reports at storage_path. Pruned after 14 days by prune_maintenance().';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."labor_contracts" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -3418,6 +3494,11 @@ ALTER TABLE ONLY "public"."integration_messages"
 
 
 
+ALTER TABLE ONLY "public"."issue_reports"
+    ADD CONSTRAINT "issue_reports_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."labor_contracts"
     ADD CONSTRAINT "labor_contracts_pkey" PRIMARY KEY ("id");
 
@@ -3678,6 +3759,10 @@ CREATE INDEX "idx_tbi_loan_apps_order" ON "public"."tbi_loan_applications" USING
 
 
 CREATE INDEX "idx_tbi_loan_apps_profile" ON "public"."tbi_loan_applications" USING "btree" ("profile_id");
+
+
+
+CREATE INDEX "issue_reports_created_at_idx" ON "public"."issue_reports" USING "btree" ("created_at" DESC);
 
 
 
@@ -4237,6 +4322,9 @@ ALTER TABLE "public"."integration_messages" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "integration_messages_hr_select" ON "public"."integration_messages" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() ->> 'user_role'::"text") = ANY (ARRAY['hr'::"text", 'admin'::"text"])) AND ("company_id" = "public"."auth_company_id"())));
 
+
+
+ALTER TABLE "public"."issue_reports" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."labor_contracts" ENABLE ROW LEVEL SECURITY;
@@ -4840,8 +4928,8 @@ GRANT ALL ON FUNCTION "public"."promote_sso_claim"("p_claim_id" "uuid", "p_invit
 
 
 
-REVOKE ALL ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer) TO "service_role";
+REVOKE ALL ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer, "reports_keep_days" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer, "reports_keep_days" integer) TO "service_role";
 
 
 
@@ -4862,6 +4950,11 @@ GRANT ALL ON FUNCTION "public"."refresh_company_metrics_co2"("p_company_ids" "uu
 
 REVOKE ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" "uuid"[]) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."request_issue_reports_prune"("keep_days" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."request_issue_reports_prune"("keep_days" integer) TO "service_role";
 
 
 
@@ -5138,6 +5231,10 @@ GRANT ALL ON TABLE "public"."integration_configs" TO "service_role";
 GRANT ALL ON TABLE "public"."integration_messages" TO "anon";
 GRANT ALL ON TABLE "public"."integration_messages" TO "authenticated";
 GRANT ALL ON TABLE "public"."integration_messages" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."issue_reports" TO "service_role";
 
 
 

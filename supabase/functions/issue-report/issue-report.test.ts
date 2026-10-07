@@ -68,6 +68,9 @@ Deno.test("scrub matches the app's TelemetrySanitizer", () => {
   assertEquals(scrub("Authorization: Bearer abcdefgh12345"), "Authorization=<redacted:authorization> <redacted:token>")
   assertEquals(scrub("jwt eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl"), "jwt <redacted:jwt>")
   assertEquals(scrub("password: hunter22"), "password=<redacted:password>")
+  assertEquals(scrub("user_id=eq.abc-123"), "user_id=<redacted:user_id>")
+  assertEquals(scrub('{"user_id":"abc-123"}'), '{"user_id=<redacted:user_id>"}')
+  assertEquals(scrub("Key (user_id)=(abc-123) exists"), "Key (user_id=<redacted:user_id>) exists")
 })
 
 Deno.test("isZip checks the local file header", () => {

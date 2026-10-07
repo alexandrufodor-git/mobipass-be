@@ -83,6 +83,7 @@ CREATE FUNCTION public.prune_maintenance(
 DECLARE
   cache_rows   bigint;
   history_rows bigint;
+  reports_req  bigint;
 BEGIN
   -- Finished runs only: a running sync still reads its cache.
   DELETE FROM public.sync_run_cache c
@@ -96,10 +97,17 @@ BEGIN
   WHERE start_time < now() - make_interval(days => history_keep_days);
   GET DIAGNOSTICS history_rows = ROW_COUNT;
 
+  -- A failing reports request must not roll back the two deletes above.
+  BEGIN
+    reports_req := public.request_issue_reports_prune(reports_keep_days);
+  EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'prune_maintenance: issue reports request failed: %', SQLERRM;
+  END;
+
   RETURN jsonb_build_object(
     'sync_run_cache', cache_rows,
     'cron_history', history_rows,
-    'issue_reports_request', public.request_issue_reports_prune(reports_keep_days)
+    'issue_reports_request', reports_req
   );
 END;
 $$;

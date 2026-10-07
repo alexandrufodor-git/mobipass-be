@@ -12,7 +12,8 @@ import { makeRestClient } from "../_shared/supabaseRest.ts"
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 const VAULT_WEBHOOK_SECRET = "bike_sync_webhook_secret"
-const BATCH = 500
+// 100 UUIDs keep the id=in.(…) delete URL well under gateway limits.
+const BATCH = 100
 
 const auth = { Authorization: `Bearer ${SERVICE_KEY}`, apikey: SERVICE_KEY }
 
@@ -60,18 +61,17 @@ Deno.serve(async (req) => {
 })
 
 // A zip whose insert and cleanup both failed has no row, so only its day folder finds it.
+// One page per folder per run: orphans are rare, and the next daily run takes any rest.
 async function sweepOrphans(cutoffDay: string): Promise<number> {
   let removed = 0
   for (const platform of ["android", "ios"]) {
     const days = await listIssueReportEntries(SUPABASE_URL, SERVICE_KEY, `${platform}/`)
     for (const day of days.filter((e) => e.id === null && e.name < cutoffDay)) {
-      while (true) {
-        const files = await listIssueReportEntries(SUPABASE_URL, SERVICE_KEY, `${platform}/${day.name}/`, BATCH)
-        const paths = files.filter((f) => f.id !== null).map((f) => `${platform}/${day.name}/${f.name}`)
-        if (paths.length === 0) break
-        await removeIssueReportFiles(SUPABASE_URL, SERVICE_KEY, paths)
-        removed += paths.length
-      }
+      const files = await listIssueReportEntries(SUPABASE_URL, SERVICE_KEY, `${platform}/${day.name}/`)
+      const paths = files.filter((f) => f.id !== null).map((f) => `${platform}/${day.name}/${f.name}`)
+      if (paths.length === 0) continue
+      await removeIssueReportFiles(SUPABASE_URL, SERVICE_KEY, paths)
+      removed += paths.length
     }
   }
   return removed

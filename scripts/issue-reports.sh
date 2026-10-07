@@ -96,9 +96,25 @@ FILTER="select=*&order=created_at.desc&limit=500"
 [[ -n "$MODEL" ]]     && FILTER+="&device_model=ilike.*$(jq -rn --arg v "$MODEL" '$v|@uri')*"
 [[ -n "$VERSION" ]]   && FILTER+="&app_version=eq.$(jq -rn --arg v "$VERSION" '$v|@uri')"
 
-ROWS=$(api "${SUPABASE_URL}/rest/v1/issue_reports?${FILTER}") || { echo "✗ query failed" >&2; exit 1; }
+uuid_range() { # id prefix → "low high" UUIDs, so the server filters (uuid has no LIKE)
+  python3 - "$1" <<'PY'
+import sys
+hexs = sys.argv[1].replace("-", "")
+fmt = lambda h: f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+print(fmt(hexs.ljust(32, "0")), fmt(hexs.ljust(32, "f")))
+PY
+}
+
 if (( ${#IDS[@]} )); then
-  ROWS=$(echo "$ROWS" | jq --args '[.[] | select(.id as $id | any($ARGS.positional[]; . as $p | $id | startswith($p)))]' "${IDS[@]}")
+  ROWS="[]"
+  for id in "${IDS[@]}"; do
+    read -r low high <<< "$(uuid_range "$id")"
+    MATCH=$(api "${SUPABASE_URL}/rest/v1/issue_reports?${FILTER}&id=gte.${low}&id=lte.${high}") \
+      || { echo "✗ query failed" >&2; exit 1; }
+    ROWS=$(jq -s 'add | unique_by(.id)' <<< "$ROWS $MATCH")
+  done
+else
+  ROWS=$(api "${SUPABASE_URL}/rest/v1/issue_reports?${FILTER}") || { echo "✗ query failed" >&2; exit 1; }
 fi
 
 if [[ "$CMD" == list ]]; then

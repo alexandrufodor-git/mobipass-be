@@ -1,11 +1,12 @@
 // supabase/functions/issue-report-prune/index.ts
 //
-// Deletes problem reports older than keep_days with their zips. Storage rejects SQL deletes, so
+// Deletes problem reports older than keep_days with their zips, then sweeps whole day folders
+// older than the cutoff for zips whose row never landed. Storage rejects SQL deletes, so
 // public.request_issue_reports_prune() (prune_maintenance cron, cron-audit.sh) calls this via pg_net.
 // verify_jwt=false: gated by the same Vault webhook secret as bike-sync.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { removeIssueReportFiles } from "../_shared/issueReportStorage.ts"
+import { listIssueReportEntries, removeIssueReportFiles } from "../_shared/issueReportStorage.ts"
 import { makeRestClient } from "../_shared/supabaseRest.ts"
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
@@ -51,9 +52,27 @@ Deno.serve(async (req) => {
       deleted += rows.length
       if (rows.length < BATCH) break
     }
-    return json({ deleted })
+    return json({ deleted, orphans: await sweepOrphans(cutoff.slice(0, 10)) })
   } catch (err) {
     console.error("[issue-report-prune] failed:", err)
     return json({ error: "internal_error" }, 500)
   }
 })
+
+// A zip whose insert and cleanup both failed has no row, so only its day folder finds it.
+async function sweepOrphans(cutoffDay: string): Promise<number> {
+  let removed = 0
+  for (const platform of ["android", "ios"]) {
+    const days = await listIssueReportEntries(SUPABASE_URL, SERVICE_KEY, `${platform}/`)
+    for (const day of days.filter((e) => e.id === null && e.name < cutoffDay)) {
+      while (true) {
+        const files = await listIssueReportEntries(SUPABASE_URL, SERVICE_KEY, `${platform}/${day.name}/`, BATCH)
+        const paths = files.filter((f) => f.id !== null).map((f) => `${platform}/${day.name}/${f.name}`)
+        if (paths.length === 0) break
+        await removeIssueReportFiles(SUPABASE_URL, SERVICE_KEY, paths)
+        removed += paths.length
+      }
+    }
+  }
+  return removed
+}

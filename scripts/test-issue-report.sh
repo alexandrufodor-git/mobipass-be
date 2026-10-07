@@ -16,6 +16,7 @@ PRUNE_URL="http://127.0.0.1:54321/functions/v1/issue-report-prune"
 JWT_SECRET="super-secret-jwt-token-with-at-least-32-characters-long"
 ID1="0e0e0e0e-0000-4000-8000-00000000e001"
 ID2="0e0e0e0e-0000-4000-8000-00000000e002"
+ORPHAN="android/2020-01-01/0e0e0e0e-0000-4000-8000-00000000e003.zip"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -52,7 +53,7 @@ SERVICE_KEY=$(supabase status -o env 2>/dev/null | sed -n 's/^SERVICE_ROLE_KEY="
 cleanup() {
   local paths
   paths=$(db "SELECT coalesce(json_agg(name), '[]') FROM storage.objects
-              WHERE bucket_id = 'issue-reports' AND name ~ '0e0e0e0e-0000-4000-8000-00000000e00[12]'")
+              WHERE bucket_id = 'issue-reports' AND name ~ '0e0e0e0e-0000-4000-8000-00000000e00[123]'")
   curl -s -o /dev/null -X DELETE "http://127.0.0.1:54321/storage/v1/object/issue-reports" \
     -H "Authorization: Bearer ${SERVICE_KEY}" -H "apikey: ${SERVICE_KEY}" \
     -H 'Content-Type: application/json' -d "{\"prefixes\":${paths}}"
@@ -93,6 +94,25 @@ curl -s -X POST "$PRUNE_URL" -H 'Content-Type: application/json' -H "x-webhook-s
 check "prune reports deleted ≥ 1" true "$(python3 -c "import json;print(str(json.load(open('$TMP/prune.json'))['deleted']>=1).lower())")"
 check "row gone" 0 "$(db "SELECT count(*) FROM public.issue_reports WHERE id = '${ID1}'")"
 check "file gone" 0 "$(db "SELECT count(*) FROM storage.objects WHERE bucket_id = 'issue-reports' AND name = '${PATH1}'")"
+
+echo "═══ Prune sweeps a zip that has no row ═══"
+orphan() { # upload a row-less zip in an old day folder; prints how many exist
+  curl -s -o /dev/null -X POST "http://127.0.0.1:54321/storage/v1/object/issue-reports/${ORPHAN}" \
+    -H "Authorization: Bearer ${SERVICE_KEY}" -H "apikey: ${SERVICE_KEY}" -H 'Content-Type: application/zip' \
+    --data-binary "@$TMP/report.zip"
+  db "UPDATE storage.objects SET created_at = now() - interval '20 days' WHERE bucket_id = 'issue-reports' AND name = '${ORPHAN}'" > /dev/null
+  orphans
+}
+orphans() { db "SELECT count(*) FROM storage.objects WHERE bucket_id = 'issue-reports' AND name = '${ORPHAN}'"; }
+check "orphan zip stored" 1 "$(orphan)"
+curl -s -X POST "$PRUNE_URL" -H 'Content-Type: application/json' -H "x-webhook-secret: ${SECRET}" \
+  -d '{"keep_days":14}' > "$TMP/prune.json"
+check "prune reports orphans ≥ 1" true "$(python3 -c "import json;print(str(json.load(open('$TMP/prune.json'))['orphans']>=1).lower())")"
+check "orphan zip gone" 0 "$(orphans)"
+check "orphan stored again" 1 "$(orphan)"
+check "an orphan alone triggers the cron request" t "$(db "SELECT public.request_issue_reports_prune(14) IS NOT NULL")"
+for _ in $(seq 1 20); do [ "$(orphans)" = 0 ] && break; sleep 0.5; done
+check "cron request swept it" 0 "$(orphans)"
 
 echo "═══ Prune (prune_maintenance → pg_net) ═══"
 check "second report → 201" 201 "$(post "$(meta "$ID2")" "$TMP/report.zip")"

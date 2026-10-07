@@ -31,7 +31,8 @@ INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_typ
 VALUES ('issue-reports', 'issue-reports', false, 5242880, ARRAY['application/zip']);
 
 -- Storage objects can't be deleted from SQL, so expired reports are removed by the issue-report-prune edge function.
--- Returns the pg_net request id, or NULL when nothing is expired (no call made).
+-- Returns the pg_net request id, or NULL when nothing is expired (no call made). Checks files too:
+-- a zip whose row never landed is only found there.
 CREATE FUNCTION public.request_issue_reports_prune(keep_days integer DEFAULT 14) RETURNS bigint
     LANGUAGE plpgsql
     SET search_path TO 'public', 'net', 'vault'
@@ -41,7 +42,9 @@ DECLARE
   v_base   text;
   v_req    bigint;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM public.issue_reports WHERE created_at < now() - make_interval(days => keep_days)) THEN
+  IF NOT EXISTS (SELECT 1 FROM public.issue_reports WHERE created_at < now() - make_interval(days => keep_days))
+     AND NOT EXISTS (SELECT 1 FROM storage.objects
+                     WHERE bucket_id = 'issue-reports' AND created_at < now() - make_interval(days => keep_days)) THEN
     RETURN NULL;
   END IF;
   SELECT decrypted_secret INTO v_secret FROM vault.decrypted_secrets WHERE name = 'bike_sync_webhook_secret' LIMIT 1;

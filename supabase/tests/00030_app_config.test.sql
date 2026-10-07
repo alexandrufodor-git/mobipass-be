@@ -8,7 +8,7 @@ SET search_path TO extensions, public;
 --  T09     seed rows ios/android = 1.0.0
 --  T10     anon can read the seed rows through RLS
 --  T11     min_version check rejects a malformed version
---  T12     platform check rejects an unknown platform
+--  T12     platform enum rejects an unknown platform
 --  T13     min_version check rejects a 5-digit segment
 --  T14     RLS is enabled
 --  T15     only the app_config_select policy exists
@@ -28,7 +28,7 @@ SELECT throws_ok($$INSERT INTO public.app_config (platform, min_version) VALUES 
 SELECT throws_ok($$UPDATE public.app_config SET min_version = '9.9.9'$$, '42501', NULL, 'T04: anon UPDATE denied');
 SELECT throws_ok($$DELETE FROM public.app_config$$, '42501', NULL, 'T05: anon DELETE denied');
 SELECT results_eq(
-  $$SELECT platform, min_version FROM public.app_config ORDER BY platform$$,
+  $$SELECT platform::text, min_version FROM public.app_config ORDER BY platform$$,
   $$VALUES ('android'::text, '1.0.0'::text), ('ios', '1.0.0')$$,
   'T10: anon reads the seed rows');
 RESET ROLE;
@@ -40,12 +40,12 @@ SELECT throws_ok($$DELETE FROM public.app_config$$, '42501', NULL, 'T08: authent
 RESET ROLE;
 
 SELECT set_eq(
-  $$SELECT platform, min_version FROM public.app_config$$,
+  $$SELECT platform::text, min_version FROM public.app_config$$,
   $$VALUES ('ios'::text, '1.0.0'::text), ('android', '1.0.0')$$,
   'T09: seed rows present');
 
 SELECT throws_ok($$UPDATE public.app_config SET min_version = '1.2.3-beta' WHERE platform = 'ios'$$, '23514', NULL, 'T11: malformed min_version rejected');
-SELECT throws_ok($$INSERT INTO public.app_config (platform, min_version) VALUES ('web', '1.0.0')$$, '23514', NULL, 'T12: unknown platform rejected');
+SELECT throws_ok($$INSERT INTO public.app_config (platform, min_version) VALUES ('web', '1.0.0')$$, '22P02', NULL, 'T12: unknown platform rejected');
 
 SELECT throws_ok($$UPDATE public.app_config SET min_version = '10000.0.0' WHERE platform = 'ios'$$, '23514', NULL, 'T13: 5-digit segment rejected');
 

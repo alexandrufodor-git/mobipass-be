@@ -66,6 +66,15 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA "extensions";
 
 
 
+CREATE TYPE "public"."app_platform" AS ENUM (
+    'ios',
+    'android'
+);
+
+
+ALTER TYPE "public"."app_platform" OWNER TO "postgres";
+
+
 CREATE TYPE "public"."benefit_status" AS ENUM (
     'inactive',
     'searching',
@@ -2521,11 +2530,10 @@ ALTER FUNCTION "public"."update_updated_at_column"() OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."app_config" (
-    "platform" "text" NOT NULL,
+    "platform" "public"."app_platform" NOT NULL,
     "min_version" "text" NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "app_config_min_version_check" CHECK (("min_version" ~ '^[0-9]{1,4}(\.[0-9]{1,4}){0,2}$'::"text")),
-    CONSTRAINT "app_config_platform_check" CHECK (("platform" = ANY (ARRAY['ios'::"text", 'android'::"text"])))
+    CONSTRAINT "app_config_min_version_check" CHECK (("min_version" ~ '^[0-9]{1,4}(\.[0-9]{1,4}){0,2}$'::"text"))
 );
 
 

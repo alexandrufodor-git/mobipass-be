@@ -42,9 +42,9 @@ mint() {
 }
 JWT=$(mint "0e0e0e0e-0000-4000-8000-0000000000aa")
 
-post() { # meta file [auth header] → http status
+post() { # meta file [auth header] [extra curl args…] → http status
   curl -s -o "$TMP/out.json" -w '%{http_code}' -X POST "$URL" -H "${3:-Authorization: Bearer ${JWT}}" \
-    -F "meta=$1" -F "file=@$2;type=application/zip"
+    -F "meta=$1" -F "file=@$2;type=application/zip" "${@:4}"
 }
 
 SERVICE_KEY=$(supabase status -o env 2>/dev/null | sed -n 's/^SERVICE_ROLE_KEY="\(.*\)"$/\1/p')
@@ -83,6 +83,8 @@ check "file stored at the row's path" 1 "$(db "SELECT count(*) FROM storage.obje
 check "same report_id → 409" 409 "$(post "$(meta "$ID1")" "$TMP/report.zip")"
 check "not a zip → 400" 400 "$(post "$(meta "$ID2")" "$TMP/fake.zip")"
 check "bad platform → 400" 400 "$(post "$(meta "$ID2" | sed 's/android/web/')" "$TMP/report.zip")"
+head -c 6000000 /dev/zero > "$TMP/big.bin"
+check "oversized chunked body → 413" 413 "$(post "$(meta "$ID2")" "$TMP/big.bin" "Authorization: Bearer ${JWT}" -H 'Transfer-Encoding: chunked')"
 check "nothing stored for rejects" 0 "$(db "SELECT count(*) FROM public.issue_reports WHERE id = '${ID2}'")"
 
 echo "═══ Prune (issue-report-prune) ═══"

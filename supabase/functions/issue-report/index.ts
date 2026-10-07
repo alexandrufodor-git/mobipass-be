@@ -31,10 +31,12 @@ Deno.serve(async (req) => {
 })
 
 async function upload(req: Request): Promise<Response> {
-  if (Number(req.headers.get("content-length") ?? 0) > MAX_ZIP_BYTES + 64 * 1024) {
-    return json({ error: "too_large" }, 413)
-  }
-  const form = await req.formData().catch(() => null)
+  // Read with a hard cap rather than trusting Content-Length (absent when chunked).
+  const body = await readCapped(req, MAX_ZIP_BYTES + 64 * 1024)
+  if (!body) return json({ error: "too_large" }, 413)
+  const form = await new Response(body, { headers: { "content-type": req.headers.get("content-type") ?? "" } })
+    .formData()
+    .catch(() => null)
   if (!form) return json({ error: "invalid_body" }, 400)
 
   let rawMeta: unknown
@@ -78,4 +80,29 @@ async function upload(req: Request): Promise<Response> {
     return inserted.status === 409 ? json({ error: "duplicate" }, 409) : json({ error: "insert_failed" }, 500)
   }
   return json({ id: row.id }, 201)
+}
+
+/** The whole body, or null as soon as it passes [limit] bytes. */
+async function readCapped(req: Request, limit: number): Promise<Uint8Array<ArrayBuffer> | null> {
+  const reader = req.body?.getReader()
+  if (!reader) return new Uint8Array()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    size += value.length
+    if (size > limit) {
+      await reader.cancel()
+      return null
+    }
+    chunks.push(value)
+  }
+  const body = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) {
+    body.set(chunk, offset)
+    offset += chunk.length
+  }
+  return body
 }

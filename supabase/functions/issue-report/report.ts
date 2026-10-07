@@ -79,9 +79,10 @@ export function storagePath(row: IssueReportRow, now: Date): string {
 // Same rules as the app's TelemetrySanitizer; bearer must run before sensitiveParam.
 const BEARER = /\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/gi
 const SENSITIVE_PARAM =
-  /\b(access_token|refresh_token|provider_token|provider_refresh_token|id_token|token|apikey|api_key|password|secret|authorization|user_id)["')]*\s*[=:]\s*["'(]?([^&\s"',})]+)/gi
+  /\b(access_token|refresh_token|provider_token|provider_refresh_token|id_token|token|apikey|api_key|password|secret|authorization|user_id|lat|lon|lng|latitude|longitude)["')]*\s*[=:]\s*["'(]?([^&\s"',})]+)/gi
 const JWT = /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g
 const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g
+const COORDINATE_PAIR = /-?\d{1,3}\.\d{4,}\s*,\s*-?\d{1,3}\.\d{4,}/g
 
 export function scrub(text: string): string {
   return text
@@ -89,4 +90,5 @@ export function scrub(text: string): string {
     .replace(SENSITIVE_PARAM, (_, key: string) => `${key}=<redacted:${key.toLowerCase()}>`)
     .replace(JWT, "<redacted:jwt>")
     .replace(EMAIL, "<redacted:email>")
+    .replace(COORDINATE_PAIR, "<redacted:coords>")
 }

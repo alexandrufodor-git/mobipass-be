@@ -71,6 +71,7 @@ Deno.test("scrub matches the app's TelemetrySanitizer", () => {
   assertEquals(scrub("user_id=eq.abc-123"), "user_id=<redacted:user_id>")
   assertEquals(scrub('{"user_id":"abc-123"}'), '{"user_id=<redacted:user_id>"}')
   assertEquals(scrub("Key (user_id)=(abc-123) exists"), "Key (user_id=<redacted:user_id>) exists")
+  assertEquals(scrub("near 46.7712,23.6236 at lat=46.77"), "near <redacted:coords> at lat=<redacted:lat>")
 })
 
 Deno.test("isZip checks the local file header", () => {

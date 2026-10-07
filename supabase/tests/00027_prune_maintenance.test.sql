@@ -9,10 +9,14 @@ SET search_path TO extensions, public;
 --  T04 the sync_runs rows themselves are kept (run telemetry)
 --  T05 authenticated can't execute it
 --  T06 the cron job is scheduled daily at 04:00 UTC
+--  T07 no issue_reports request when nothing is expired
+--  T08 issue_reports: anon/authenticated have no access
+--  T09 issue-reports bucket is private
+--  T10 anon/authenticated can't execute request_issue_reports_prune
 -- ============================================================
 
 BEGIN;
-SELECT plan(6);
+SELECT plan(10);
 
 DO $$
 DECLARE
@@ -58,12 +62,32 @@ SELECT is(
   1, 'T04: sync_runs row kept'
 );
 SELECT ok(
-  NOT has_function_privilege('authenticated', 'public.prune_maintenance(integer, integer)', 'execute'),
+  NOT has_function_privilege('authenticated', 'public.prune_maintenance(integer, integer, integer)', 'execute'),
   'T05: authenticated cannot execute'
 );
 SELECT is(
   (SELECT schedule FROM cron.job WHERE jobname = 'db-maintenance-prune'),
   '0 4 * * *', 'T06: scheduled daily at 04:00 UTC'
+);
+
+SELECT is(
+  public.prune_maintenance() -> 'issue_reports_request',
+  'null'::jsonb, 'T07: no prune request without expired reports'
+);
+SELECT ok(
+  NOT has_table_privilege('anon', 'public.issue_reports', 'select')
+  AND NOT has_table_privilege('authenticated', 'public.issue_reports', 'insert'),
+  'T08: issue_reports is service_role only'
+);
+SELECT is(
+  (SELECT public FROM storage.buckets WHERE id = 'issue-reports'),
+  false, 'T09: issue-reports bucket is private'
+);
+
+SELECT ok(
+  NOT has_function_privilege('anon', 'public.request_issue_reports_prune(integer)', 'execute')
+  AND NOT has_function_privilege('authenticated', 'public.request_issue_reports_prune(integer)', 'execute'),
+  'T10: request_issue_reports_prune is not callable by anon/authenticated'
 );
 
 SELECT * FROM finish();

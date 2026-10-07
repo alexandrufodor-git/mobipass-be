@@ -7,6 +7,7 @@
 #   ./scripts/cron-audit.sh cache show <run_id> [scope]  peek inside a run's cache (no scope = list its scopes)
 #   ./scripts/cron-audit.sh cache prune [--keep-days N] [--apply]    default 7 days
 #   ./scripts/cron-audit.sh history prune [--keep-days N] [--apply]  default 14 days
+#   ./scripts/cron-audit.sh reports prune [--keep-days N] [--apply]  default 14 days
 #
 # Prunes are dry runs unless --apply is given. Deleted space is reused by Postgres;
 # the reported database size may only drop after VACUUM FULL on that table.
@@ -105,7 +106,10 @@ report() {
      $(printf "$CACHE_OLD" 7)
      union all
      select 'cron history > 14 days', count(*), '-'
-     from cron.job_run_details where start_time < now() - interval '14 days';"
+     from cron.job_run_details where start_time < now() - interval '14 days'
+     union all
+     select 'reports > 14 days', count(*), pg_size_pretty(coalesce(sum(size_bytes), 0))
+     from public.issue_reports where created_at < now() - interval '14 days';"
 
   echo
   echo "═══ end ═══"
@@ -176,6 +180,20 @@ history_prune() {
   fi
 }
 
+# Files live in Storage, which rejects SQL deletes: --apply asks the issue-report-prune edge function (async).
+reports_prune() {
+  KEEP=14; parse_prune_args "$@"
+  echo "── Problem reports older than $KEEP days ──"
+  q "select count(*) as rows, pg_size_pretty(coalesce(sum(size_bytes), 0)) as files
+     from public.issue_reports where created_at < now() - interval '$KEEP days';"
+  if (( APPLY )); then
+    q "select public.request_issue_reports_prune($KEEP) as net_request_id;"
+    echo "  Requested. Rows and files are deleted by the edge function; re-run without --apply to confirm."
+  else
+    echo "  Dry run. Add --apply to delete."
+  fi
+}
+
 usage() { cat <<'EOF'
 cron-audit.sh — pg_cron jobs and database size, PRODUCTION (supabase db query --linked).
 Needs an existing `supabase link`. Nothing is deleted without --apply.
@@ -188,6 +206,7 @@ COMMANDS
   cache show <run_id> <scope>            Peek inside one scope (arrays: first 3 items; objects: keys + sizes).
   cache prune [--keep-days N] [--apply]  Delete the cache of FINISHED sync runs older than N days (default 7).
   history prune [--keep-days N] [--apply]  Delete cron run history older than N days (default 14).
+  reports prune [--keep-days N] [--apply]  Delete problem reports + their zips older than N days (default 14).
   -h, --help                             This text.
 
 REPORT SECTIONS
@@ -197,7 +216,7 @@ REPORT SECTIONS
                 "(deleted job)" = history left by jobs that were unscheduled.
   3 Failures    Failed runs in the last 7 days, with the error message.
   4 Size        Database size and the 10 largest tables.
-  5 Growth      What the two prunes would remove right now.
+  5 Growth      What the three prunes would remove right now.
 
 WHAT THE BIG TABLES ARE
   public.sync_run_cache  Working copy the bike sync fetches from the vendor (BellaBike) during a run:
@@ -233,5 +252,7 @@ case "${1:-}" in
            esac ;;
   history) shift; [[ "${1:-}" == prune ]] || { echo "usage: $0 history prune" >&2; exit 1; }
            shift; history_prune "$@" ;;
+  reports) shift; [[ "${1:-}" == prune ]] || { echo "usage: $0 reports prune" >&2; exit 1; }
+           shift; reports_prune "$@" ;;
   *) usage >&2; exit 1 ;;
 esac

@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-CONFIG="${CONFIG:-config.toml}"
+CONFIG="${CONFIG:-supabase/config.toml}"
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "error: $CONFIG not found (run from repo root)" >&2

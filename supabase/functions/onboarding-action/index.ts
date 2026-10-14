@@ -14,7 +14,7 @@ import { ACTIONS_NEEDING_BIKE, ActionBenefit, FOLLOW_UP, decide, isAction } from
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 
-const BENEFIT_SELECT = "*,bike:bikes(id,name,images,image_url),copilot"
+const BENEFIT_SELECT = "*,bike:bikes(*,specifications,dealer:dealers(*)),copilot"
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 async function writeBenefit(

@@ -25,6 +25,22 @@ const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 // Sent on every BellaBike request so their Cloudflare can allowlist our sync
 // past Bot Fight Mode / Managed Challenge (which a server can't solve).
 const SYNC_CLIENT_ID = "mobipass-bike-sync"
+// Cloudflare Access service token (prod only — absent locally).
+export const VAULT_BELLA_CF_ID     = "bike_bella_cf_access_id"
+export const VAULT_BELLA_CF_SECRET = "bike_bella_cf_access_secret"
+
+// What gets a server request past BellaBike's Cloudflare: the browser UA, our sync id (they
+// allowlist it past the bot challenge a server can't solve) and the Access service token when set.
+// Shared by the sync and the photo normaliser.
+export function bellaHeaders(cfAccessId: string | null, cfAccessSecret: string | null): Record<string, string> {
+  return {
+    "User-Agent":      UA,
+    "X-MobiPass-Sync": SYNC_CLIENT_ID,
+    ...(cfAccessId && cfAccessSecret
+      ? { "CF-Access-Client-Id": cfAccessId, "CF-Access-Client-Secret": cfAccessSecret }
+      : {}),
+  }
+}
 
 // Decoded option attributes promoted to raw_specs (and a few to columns).
 const SPEC_CODES = [
@@ -98,30 +114,13 @@ export class Magento {
     private cfAccessSecret: string | null = null,
   ) {}
 
-  // Cloudflare Access service-token headers, sent on every BellaBike request
-  // (REST + GraphQL — both are behind the same Access policy). Empty when the
-  // service token isn't configured.
-  private cfHeaders(): Record<string, string> {
-    return this.cfAccessId && this.cfAccessSecret
-      ? {
-          "CF-Access-Client-Id":     this.cfAccessId,
-          "CF-Access-Client-Secret": this.cfAccessSecret,
-        }
-      : {}
-  }
-
   async rest<T = unknown>(path: string): Promise<T> {
     const res = await fetch(`${REST_BASE}/${path}`, {
       headers: {
         Authorization:     `Bearer ${this.token}`,
-        "User-Agent":      UA,
         "Accept":          "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        // Identifier so BellaBike's Cloudflare can skip the bot challenge for
-        // our server-to-server sync (it can't solve a JS challenge). The
-        // Magento Bearer token still does the actual authentication.
-        "X-MobiPass-Sync": SYNC_CLIENT_ID,
-        ...this.cfHeaders(),
+        ...bellaHeaders(this.cfAccessId, this.cfAccessSecret),
       },
     })
     if (!res.ok) {
@@ -151,9 +150,7 @@ export class Magento {
       method: "POST",
       headers: {
         "Content-Type":    "application/json",
-        "User-Agent":      UA,
-        "X-MobiPass-Sync": SYNC_CLIENT_ID,
-        ...this.cfHeaders(),
+        ...bellaHeaders(this.cfAccessId, this.cfAccessSecret),
       },
       body: JSON.stringify({ query }),
     })

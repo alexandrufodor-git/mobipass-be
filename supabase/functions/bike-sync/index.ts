@@ -22,6 +22,8 @@ console.info("bike-sync starting")
 import { makeRestClient, type RestClient } from "../_shared/supabaseRest.ts"
 import {
   Magento,
+  VAULT_BELLA_CF_ID,
+  VAULT_BELLA_CF_SECRET,
   type MagentoProduct,
   type OptionMaps,
   fetchOptionMaps,
@@ -35,10 +37,6 @@ import {
 
 const VAULT_WEBHOOK_SECRET = "bike_sync_webhook_secret"
 const VAULT_BELLA_TOKEN    = "vendor_bela_access"
-// Cloudflare Access service token (prod only — absent locally). Sent as
-// CF-Access-Client-Id / CF-Access-Client-Secret on every BellaBike request.
-const VAULT_BELLA_CF_ID     = "bike_bella_cf_access_id"
-const VAULT_BELLA_CF_SECRET = "bike_bella_cf_access_secret"
 
 const PAGE_SIZE     = 50    // SKUs per rest_page unit — sized to finish in budget
 const SALABLE_POOL  = 8     // concurrent is-product-salable calls per page

@@ -462,6 +462,12 @@ verify_jwt = false # pg_net via request_issue_reports_prune(), gated by the Vaul
 import_map = "./functions/issue-report-prune/deno.json"
 entrypoint = "./functions/issue-report-prune/index.ts"
 
+[functions.bike-image-normalize]
+enabled = true
+verify_jwt = false # pg_cron + manual runs via bike_images_invoke(), gated by the Vault webhook secret
+import_map = "./functions/bike-image-normalize/deno.json"
+entrypoint = "./functions/bike-image-normalize/index.ts"
+
 [functions.live-test-push]
 enabled = true
 verify_jwt = false # pg_cron via live_test_tick(), gated by the Vault webhook secret

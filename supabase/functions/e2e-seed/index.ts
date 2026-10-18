@@ -425,7 +425,7 @@ async function resetToPickupReadyNoAddress(userId: string, companyId: string): P
   const benefit = (await benefitRes.json() as { id: string }[])[0]
 
   await rest("POST", `/rest/v1/bike_orders`,
-    { user_id: userId, bike_benefit_id: benefit.id, helmet: false, insurance: false },
+    { user_id: userId, bike_benefit_id: benefit.id, helmet: false },
     "return=minimal")
 
   await rest("POST", `/rest/v1/contracts`, {
@@ -463,7 +463,7 @@ async function resetToCompleted(userId: string, companyId: string, withAddress: 
   const benefit = (await benefitRes.json() as { id: string }[])[0]
 
   await rest("POST", `/rest/v1/bike_orders`,
-    { user_id: userId, bike_benefit_id: benefit.id, helmet: false, insurance: false },
+    { user_id: userId, bike_benefit_id: benefit.id, helmet: false },
     "return=minimal")
 
   // Stub contracts row so get-employee-details returns a sign_page_url and

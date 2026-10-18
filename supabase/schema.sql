@@ -2641,7 +2641,7 @@ CREATE TABLE IF NOT EXISTS "public"."bike_orders" (
     "user_id" "uuid" NOT NULL,
     "bike_benefit_id" "uuid" NOT NULL,
     "helmet" boolean DEFAULT false NOT NULL,
-    "insurance" boolean DEFAULT false NOT NULL,
+    "insurance" boolean,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "bike_id" "uuid",

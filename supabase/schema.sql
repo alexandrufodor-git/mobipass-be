@@ -269,6 +269,160 @@ COMMENT ON FUNCTION "public"."authorize"("requested_permission" "public"."user_r
 
 
 
+CREATE OR REPLACE FUNCTION "public"."bike_display_images"("p_images" "jsonb") RETURNS "jsonb"
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE WHEN p_images IS NULL THEN NULL ELSE COALESCE((
+    SELECT jsonb_agg(COALESCE(bi.url, src.value) ORDER BY src.ord)
+    FROM jsonb_array_elements_text(p_images) WITH ORDINALITY AS src(value, ord)
+    LEFT JOIN public.bike_images bi ON bi.source_url = src.value AND bi.status = 'normalized'
+  ), '[]'::jsonb) END
+$$;
+
+
+ALTER FUNCTION "public"."bike_display_images"("p_images" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."bike_images_due"("p_limit" integer, "p_rule_version" integer) RETURNS TABLE("source_url" "text", "status" "text", "rule_version" integer, "source_etag" "text", "source_bytes" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT u.url, bi.status, bi.rule_version, bi.source_etag, bi.source_bytes
+  FROM (
+    SELECT DISTINCT ON (src.url) src.url, b.in_stock
+    FROM public.bikes b
+    JOIN public.bike_models m ON m.id = b.model_id
+    CROSS JOIN LATERAL jsonb_array_elements_text(m.images) AS src(url)
+    WHERE b.active
+    ORDER BY src.url, b.in_stock DESC
+  ) u
+  LEFT JOIN public.bike_images bi ON bi.source_url = u.url
+  WHERE bi.source_url IS NULL
+     OR bi.rule_version < p_rule_version
+     OR bi.status = 'failed'
+     OR (bi.status <> 'failed' AND bi.checked_at < now() - interval '7 days')
+  ORDER BY u.in_stock DESC, bi.checked_at NULLS FIRST
+  LIMIT p_limit
+$$;
+
+
+ALTER FUNCTION "public"."bike_images_due"("p_limit" integer, "p_rule_version" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."bike_images_invoke"("p_body" "jsonb" DEFAULT '{}'::"jsonb") RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'net', 'vault'
+    AS $$
+DECLARE
+  v_secret text;
+  v_base   text;
+  v_req    bigint;
+BEGIN
+  SELECT decrypted_secret INTO v_secret FROM vault.decrypted_secrets WHERE name = 'bike_sync_webhook_secret' LIMIT 1;
+  IF v_secret IS NULL THEN
+    RAISE WARNING '[bike_images_invoke] Vault secret "bike_sync_webhook_secret" not found';
+    RETURN NULL;
+  END IF;
+  SELECT decrypted_secret INTO v_base FROM vault.decrypted_secrets WHERE name = 'bike_sync_base_url' LIMIT 1;
+  v_base := COALESCE(v_base, 'https://xlfkdumbsflqxpezolhl.supabase.co');
+
+  SELECT net.http_post(
+    url     := v_base || '/functions/v1/bike-image-normalize',
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-webhook-secret', v_secret),
+    body    := p_body,
+    timeout_milliseconds := 120000
+  ) INTO v_req;
+  RETURN v_req;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."bike_images_invoke"("p_body" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."bike_images_kickoff"("p_mode" "text" DEFAULT 'manual'::"text") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_run_id uuid;
+  v_units  integer;
+BEGIN
+  SELECT id INTO v_run_id FROM bike_image_runs WHERE status = 'running' LIMIT 1;
+  IF v_run_id IS NOT NULL THEN
+    RETURN v_run_id;
+  END IF;
+
+  INSERT INTO bike_image_runs (mode, rule_version)
+  VALUES (p_mode, public.bike_images_rule_version())
+  RETURNING id INTO v_run_id;
+
+  INSERT INTO bike_image_units (run_id, source_url)
+  SELECT v_run_id, d.source_url FROM public.bike_images_due(1000000, public.bike_images_rule_version()) d;
+  GET DIAGNOSTICS v_units = ROW_COUNT;
+
+  UPDATE bike_image_runs SET n_units = v_units WHERE id = v_run_id;
+  IF v_units = 0 THEN
+    PERFORM public.finalize_bike_image_run(v_run_id);
+  ELSE
+    PERFORM public.bike_images_invoke(jsonb_build_object('run_id', v_run_id));
+  END IF;
+  RETURN v_run_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."bike_images_kickoff"("p_mode" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."bike_images_rule_version"() RETURNS integer
+    LANGUAGE "sql" IMMUTABLE
+    AS $$ SELECT 1 $$;
+
+
+ALTER FUNCTION "public"."bike_images_rule_version"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."bike_images_tick"() RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  c_max_lanes constant integer := 1;  -- one photo at a time: bellabike.ro is behind Cloudflare
+  r           record;
+  v_inflight  integer;
+  v_claimable integer;
+  v_waiting   integer;
+  v_fired     integer := 0;
+BEGIN
+  FOR r IN SELECT id, last_claim_at FROM bike_image_runs WHERE status = 'running' LOOP
+    SELECT count(*) INTO v_inflight FROM bike_image_units
+      WHERE run_id = r.id AND status = 'running' AND leased_until >= now();
+    SELECT count(*) INTO v_claimable FROM bike_image_units
+      WHERE run_id = r.id
+        AND (   (status = 'enqueued' AND (next_retry_at IS NULL OR next_retry_at <= now()))
+             OR (status = 'running'  AND leased_until < now()));
+    SELECT count(*) INTO v_waiting FROM bike_image_units
+      WHERE run_id = r.id AND status = 'enqueued' AND next_retry_at > now();
+
+    -- Re-fire only a dead lane: no claim for 30 s (a live lane claims every ~3 s).
+    IF v_inflight < c_max_lanes AND v_claimable > 0
+       AND (r.last_claim_at IS NULL OR r.last_claim_at < now() - interval '30 seconds') THEN
+      PERFORM public.bike_images_invoke(jsonb_build_object('run_id', r.id));
+      v_fired := v_fired + 1;
+    ELSIF v_inflight = 0 AND v_claimable = 0 AND v_waiting = 0 THEN
+      PERFORM public.finalize_bike_image_run(r.id);
+    END IF;
+  END LOOP;
+  RETURN v_fired;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."bike_images_tick"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'net', 'vault'
@@ -492,6 +646,89 @@ SET default_tablespace = '';
 SET default_table_access_method = "heap";
 
 
+CREATE TABLE IF NOT EXISTS "public"."bike_image_units" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "run_id" "uuid" NOT NULL,
+    "source_url" "text" NOT NULL,
+    "status" "text" DEFAULT 'enqueued'::"text" NOT NULL,
+    "outcome" "text",
+    "attempts" integer DEFAULT 0 NOT NULL,
+    "next_retry_at" timestamp with time zone,
+    "leased_until" timestamp with time zone,
+    "started_at" timestamp with time zone,
+    "finished_at" timestamp with time zone,
+    "bytes_downloaded" bigint DEFAULT 0 NOT NULL,
+    "bytes_stored" bigint DEFAULT 0 NOT NULL,
+    "error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "bike_image_units_outcome_check" CHECK (("outcome" = ANY (ARRAY['normalized'::"text", 'kept'::"text", 'unchanged'::"text"]))),
+    CONSTRAINT "bike_image_units_status_check" CHECK (("status" = ANY (ARRAY['enqueued'::"text", 'running'::"text", 'succeeded'::"text", 'failed'::"text"])))
+);
+
+
+ALTER TABLE "public"."bike_image_units" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."bike_image_units" IS 'One source photo in a run: lease, attempts (3, then failed), outcome, bytes, error.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_next_bike_image_unit"("p_run_id" "uuid", "p_lease_seconds" integer DEFAULT 90) RETURNS "public"."bike_image_units"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE v_unit public.bike_image_units;
+BEGIN
+  -- One lane: a claim within 1.5 s of the last one comes from a duplicate lane, which then ends.
+  UPDATE bike_image_runs SET last_claim_at = now()
+  WHERE id = p_run_id AND (last_claim_at IS NULL OR last_claim_at < now() - interval '1.5 seconds');
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  -- A unit whose worker was killed (CPU / memory limit) on all 3 tries never reaches
+  -- complete_bike_image_unit: fail it here so the run can finish. A normalized copy stays.
+  WITH dead AS (
+    UPDATE bike_image_units SET status = 'failed', leased_until = NULL, finished_at = now(),
+           error = COALESCE(error, 'worker killed on every try (CPU or memory limit)')
+    WHERE run_id = p_run_id AND status = 'running' AND leased_until < now() AND attempts >= 3
+    RETURNING source_url
+  ), runs AS (
+    UPDATE bike_image_runs SET n_failed = n_failed + (SELECT count(*) FROM dead) WHERE id = p_run_id
+  )
+  INSERT INTO bike_images (source_url, status, url, rule_version)
+  SELECT source_url, 'failed', NULL, public.bike_images_rule_version() FROM dead
+  ON CONFLICT (source_url) DO UPDATE SET checked_at = now(),
+    status = CASE WHEN bike_images.status = 'normalized' THEN 'normalized' ELSE 'failed' END,
+    url    = CASE WHEN bike_images.status = 'normalized' THEN bike_images.url ELSE NULL END;
+
+  UPDATE bike_image_units SET
+    status       = 'running',
+    attempts     = attempts + 1,
+    started_at   = COALESCE(started_at, now()),
+    leased_until = now() + (p_lease_seconds * interval '1 second')
+  WHERE id = (
+    SELECT id FROM bike_image_units
+    WHERE run_id = p_run_id
+      AND (   (status = 'enqueued' AND (next_retry_at IS NULL OR next_retry_at <= now()))
+           OR (status = 'running'  AND leased_until IS NOT NULL AND leased_until < now()))
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+  )
+  RETURNING * INTO v_unit;
+
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+  RETURN v_unit;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_next_bike_image_unit"("p_run_id" "uuid", "p_lease_seconds" integer) OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."sync_units" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "run_id" "uuid" NOT NULL,
@@ -593,6 +830,65 @@ $$;
 
 
 ALTER FUNCTION "public"."co2_refresh_on_benefit_change"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."complete_bike_image_unit"("p_unit_id" "uuid", "p_status" "text", "p_outcome" "text" DEFAULT NULL::"text", "p_bytes_downloaded" bigint DEFAULT 0, "p_bytes_stored" bigint DEFAULT 0, "p_error" "text" DEFAULT NULL::"text") RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_attempts integer;
+  v_run_id   uuid;
+BEGIN
+  SELECT attempts, run_id INTO v_attempts, v_run_id FROM bike_image_units WHERE id = p_unit_id;
+
+  -- The source refused us (Cloudflare 403/429): back off 10 min without using up a try.
+  IF p_status = 'throttled' THEN
+    UPDATE bike_image_units SET
+      status        = 'enqueued',
+      attempts      = attempts - 1,
+      leased_until  = NULL,
+      next_retry_at = now() + interval '10 minutes',
+      error         = p_error
+    WHERE id = p_unit_id;
+    RETURN 'throttled';
+  END IF;
+
+  IF p_status = 'failed' AND v_attempts < 3 THEN
+    UPDATE bike_image_units SET
+      status        = 'enqueued',
+      leased_until  = NULL,
+      next_retry_at = now() + (v_attempts * interval '20 seconds'),
+      error         = p_error
+    WHERE id = p_unit_id;
+    RETURN 'retry';
+  END IF;
+
+  UPDATE bike_image_units SET
+    status           = p_status,
+    outcome          = p_outcome,
+    leased_until     = NULL,
+    bytes_downloaded = p_bytes_downloaded,
+    bytes_stored     = p_bytes_stored,
+    error            = p_error,
+    finished_at      = now()
+  WHERE id = p_unit_id;
+
+  UPDATE bike_image_runs SET
+    n_normalized     = n_normalized + (p_outcome = 'normalized')::int,
+    n_kept           = n_kept       + (p_outcome = 'kept')::int,
+    n_unchanged      = n_unchanged  + (p_outcome = 'unchanged')::int,
+    n_failed         = n_failed     + (p_status = 'failed')::int,
+    bytes_downloaded = bytes_downloaded + p_bytes_downloaded,
+    bytes_stored     = bytes_stored + p_bytes_stored
+  WHERE id = v_run_id;
+
+  RETURN p_status;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."complete_bike_image_unit"("p_unit_id" "uuid", "p_status" "text", "p_outcome" "text", "p_bytes_downloaded" bigint, "p_bytes_stored" bigint, "p_error" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."complete_sync_unit"("p_unit_id" "uuid", "p_status" "text", "p_n_fetched" integer DEFAULT 0, "p_n_inserted" integer DEFAULT 0, "p_n_updated" integer DEFAULT 0, "p_n_models" integer DEFAULT 0, "p_n_failed" integer DEFAULT 0, "p_error" "text" DEFAULT NULL::"text") RETURNS "text"
@@ -946,6 +1242,67 @@ ALTER FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" 
 
 COMMENT ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) IS 'Fan out one rest_page unit per page of a category (idempotent via the uq_sync_units_page index).';
 
+
+
+CREATE TABLE IF NOT EXISTS "public"."bike_image_runs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "mode" "text" NOT NULL,
+    "status" "text" DEFAULT 'running'::"text" NOT NULL,
+    "rule_version" integer NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "finished_at" timestamp with time zone,
+    "n_units" integer DEFAULT 0 NOT NULL,
+    "n_normalized" integer DEFAULT 0 NOT NULL,
+    "n_kept" integer DEFAULT 0 NOT NULL,
+    "n_unchanged" integer DEFAULT 0 NOT NULL,
+    "n_failed" integer DEFAULT 0 NOT NULL,
+    "bytes_downloaded" bigint DEFAULT 0 NOT NULL,
+    "bytes_stored" bigint DEFAULT 0 NOT NULL,
+    "last_claim_at" timestamp with time zone,
+    CONSTRAINT "bike_image_runs_mode_check" CHECK (("mode" = ANY (ARRAY['nightly'::"text", 'manual'::"text"]))),
+    CONSTRAINT "bike_image_runs_status_check" CHECK (("status" = ANY (ARRAY['running'::"text", 'succeeded'::"text", 'partial'::"text", 'failed'::"text"])))
+);
+
+
+ALTER TABLE "public"."bike_image_runs" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."bike_image_runs" IS 'One bike photo normalisation run (nightly or manual): unit counts by outcome, bytes, status. Pruned with the cron history; units cascade.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."finalize_bike_image_run"("p_run_id" "uuid") RETURNS "public"."bike_image_runs"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_succeeded integer;
+  v_failed    integer;
+  v_pending   integer;
+  v_run       public.bike_image_runs;
+BEGIN
+  SELECT count(*) FILTER (WHERE status = 'succeeded'),
+         count(*) FILTER (WHERE status = 'failed'),
+         count(*) FILTER (WHERE status IN ('enqueued', 'running'))
+    INTO v_succeeded, v_failed, v_pending
+    FROM bike_image_units WHERE run_id = p_run_id;
+
+  IF v_pending > 0 THEN
+    SELECT * INTO v_run FROM bike_image_runs WHERE id = p_run_id;
+    RETURN v_run;
+  END IF;
+
+  UPDATE bike_image_runs SET
+    status = CASE WHEN v_failed = 0 THEN 'succeeded' WHEN v_succeeded = 0 THEN 'failed' ELSE 'partial' END,
+    finished_at = now()
+  WHERE id = p_run_id
+  RETURNING * INTO v_run;
+  RETURN v_run;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."finalize_bike_image_run"("p_run_id" "uuid") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."sync_runs" (
@@ -1814,7 +2171,7 @@ BEGIN
         active, first_seen_at, last_seen_at, last_in_stock_at
       ) VALUES (
         m->>'name', m->>'brand', m->>'description',
-        m->'images'->>0, m->'images', NULLIF(m->>'type', '')::bike_type,
+        public.bike_display_images(m->'images')->>0, public.bike_display_images(m->'images'), NULLIF(m->>'type', '')::bike_type,
         COALESCE((o->>'full_price')::numeric, 0),
         (o->>'list_price')::numeric,
         (o->>'special_price')::numeric,
@@ -2050,6 +2407,7 @@ CREATE OR REPLACE FUNCTION "public"."prune_maintenance"("cache_keep_days" intege
 DECLARE
   cache_rows   bigint;
   history_rows bigint;
+  image_rows   bigint;
   reports_req  bigint;
 BEGIN
   -- Finished runs only: a running sync still reads its cache.
@@ -2064,6 +2422,10 @@ BEGIN
   WHERE start_time < now() - make_interval(days => history_keep_days);
   GET DIAGNOSTICS history_rows = ROW_COUNT;
 
+  DELETE FROM public.bike_image_runs
+  WHERE started_at < now() - make_interval(days => history_keep_days);
+  GET DIAGNOSTICS image_rows = ROW_COUNT;
+
   -- A failing reports request must not roll back the two deletes above.
   BEGIN
     reports_req := public.request_issue_reports_prune(reports_keep_days);
@@ -2074,6 +2436,7 @@ BEGIN
   RETURN jsonb_build_object(
     'sync_run_cache', cache_rows,
     'cron_history', history_rows,
+    'bike_image_runs', image_rows,
     'issue_reports_request', reports_req
   );
 END;
@@ -2085,6 +2448,25 @@ ALTER FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_
 
 COMMENT ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "history_keep_days" integer, "reports_keep_days" integer) IS 'Deletes sync_run_cache of finished runs older than cache_keep_days and cron.job_run_details older than history_keep_days; issue_reports older than reports_keep_days go through request_issue_reports_prune(). Run daily by the db-maintenance-prune cron job.';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."refresh_bike_display_images"("p_sources" "text"[]) RETURNS integer
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  WITH upd AS (
+    UPDATE public.bikes b
+    SET images = public.bike_display_images(m.images),
+        image_url = public.bike_display_images(m.images)->>0
+    FROM public.bike_models m
+    WHERE b.model_id = m.id AND m.images ?| p_sources
+    RETURNING 1
+  )
+  SELECT count(*)::integer FROM upd
+$$;
+
+
+ALTER FUNCTION "public"."refresh_bike_display_images"("p_sources" "text"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."refresh_company_co2_stats"("p_period" "date" DEFAULT ("date_trunc"('week'::"text", "now"()))::"date", "p_company_ids" "uuid"[] DEFAULT NULL::"uuid"[]) RETURNS "void"
@@ -2626,6 +3008,26 @@ CREATE TABLE IF NOT EXISTS "public"."app_config" (
 
 
 ALTER TABLE "public"."app_config" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."bike_images" (
+    "source_url" "text" NOT NULL,
+    "status" "text" NOT NULL,
+    "url" "text",
+    "source_etag" "text",
+    "source_bytes" bigint,
+    "rule_version" integer NOT NULL,
+    "checked_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "bike_images_check" CHECK ((("status" = 'normalized'::"text") = ("url" IS NOT NULL))),
+    CONSTRAINT "bike_images_status_check" CHECK (("status" = ANY (ARRAY['normalized'::"text", 'kept'::"text", 'failed'::"text"])))
+);
+
+
+ALTER TABLE "public"."bike_images" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."bike_images" IS 'Bike photo normalisation per source URL: normalized (url = our copy), kept (source shown as is) or failed (retried with backoff). Fingerprint (etag, bytes) and rule_version decide re-processing.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."bike_models" (
@@ -3448,6 +3850,21 @@ ALTER TABLE ONLY "public"."bike_benefits"
 
 
 
+ALTER TABLE ONLY "public"."bike_image_runs"
+    ADD CONSTRAINT "bike_image_runs_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."bike_image_units"
+    ADD CONSTRAINT "bike_image_units_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."bike_images"
+    ADD CONSTRAINT "bike_images_pkey" PRIMARY KEY ("source_url");
+
+
+
 ALTER TABLE ONLY "public"."bike_models"
     ADD CONSTRAINT "bike_models_dealer_parent_sku_key" UNIQUE ("dealer_id", "external_parent_sku");
 
@@ -3615,6 +4032,14 @@ ALTER TABLE ONLY "public"."bike_orders"
 
 ALTER TABLE ONLY "public"."user_roles"
     ADD CONSTRAINT "user_roles_pkey" PRIMARY KEY ("id");
+
+
+
+CREATE INDEX "bike_image_runs_started_at_idx" ON "public"."bike_image_runs" USING "btree" ("started_at" DESC);
+
+
+
+CREATE INDEX "bike_image_units_run_status_idx" ON "public"."bike_image_units" USING "btree" ("run_id", "status");
 
 
 
@@ -3972,6 +4397,11 @@ ALTER TABLE ONLY "public"."bike_benefits"
 
 
 
+ALTER TABLE ONLY "public"."bike_image_units"
+    ADD CONSTRAINT "bike_image_units_run_id_fkey" FOREIGN KEY ("run_id") REFERENCES "public"."bike_image_runs"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."bike_models"
     ADD CONSTRAINT "bike_models_dealer_id_fkey" FOREIGN KEY ("dealer_id") REFERENCES "public"."dealers"("id");
 
@@ -4225,6 +4655,15 @@ CREATE POLICY "bike_benefits_hr_update" ON "public"."bike_benefits" FOR UPDATE T
    FROM "public"."profiles" "p"
   WHERE (("p"."user_id" = "bike_benefits"."user_id") AND ("p"."company_id" = ( SELECT "public"."auth_company_id"() AS "auth_company_id")))))));
 
+
+
+ALTER TABLE "public"."bike_image_runs" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."bike_image_units" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."bike_images" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."bike_models" ENABLE ROW LEVEL SECURITY;
@@ -4691,6 +5130,37 @@ GRANT ALL ON FUNCTION "public"."authorize"("requested_permission" "public"."user
 
 
 
+REVOKE ALL ON FUNCTION "public"."bike_display_images"("p_images" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."bike_display_images"("p_images" "jsonb") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."bike_images_due"("p_limit" integer, "p_rule_version" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."bike_images_due"("p_limit" integer, "p_rule_version" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."bike_images_invoke"("p_body" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."bike_images_invoke"("p_body" "jsonb") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."bike_images_kickoff"("p_mode" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."bike_images_kickoff"("p_mode" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."bike_images_rule_version"() TO "anon";
+GRANT ALL ON FUNCTION "public"."bike_images_rule_version"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."bike_images_rule_version"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."bike_images_tick"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."bike_images_tick"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."bike_sync_invoke"("p_run_id" "uuid", "p_branch" "text") TO "service_role";
 
@@ -4718,6 +5188,17 @@ GRANT ALL ON FUNCTION "public"."calculate_employee_bike_price"("p_full_price" nu
 
 
 
+GRANT ALL ON TABLE "public"."bike_image_units" TO "anon";
+GRANT ALL ON TABLE "public"."bike_image_units" TO "authenticated";
+GRANT ALL ON TABLE "public"."bike_image_units" TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."claim_next_bike_image_unit"("p_run_id" "uuid", "p_lease_seconds" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_next_bike_image_unit"("p_run_id" "uuid", "p_lease_seconds" integer) TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."sync_units" TO "anon";
 GRANT ALL ON TABLE "public"."sync_units" TO "authenticated";
 GRANT ALL ON TABLE "public"."sync_units" TO "service_role";
@@ -4733,6 +5214,11 @@ REVOKE ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() TO "anon";
 GRANT ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."co2_refresh_on_benefit_change"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."complete_bike_image_unit"("p_unit_id" "uuid", "p_status" "text", "p_outcome" "text", "p_bytes_downloaded" bigint, "p_bytes_stored" bigint, "p_error" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."complete_bike_image_unit"("p_unit_id" "uuid", "p_status" "text", "p_outcome" "text", "p_bytes_downloaded" bigint, "p_bytes_stored" bigint, "p_error" "text") TO "service_role";
 
 
 
@@ -4774,6 +5260,17 @@ GRANT ALL ON FUNCTION "public"."enforce_email_matches_company_domain"() TO "serv
 
 REVOKE ALL ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."enqueue_page_units"("p_run_id" "uuid", "p_category_id" "text", "p_total" integer, "p_page_size" integer) TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."bike_image_runs" TO "anon";
+GRANT ALL ON TABLE "public"."bike_image_runs" TO "authenticated";
+GRANT ALL ON TABLE "public"."bike_image_runs" TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."finalize_bike_image_run"("p_run_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."finalize_bike_image_run"("p_run_id" "uuid") TO "service_role";
 
 
 
@@ -4990,6 +5487,11 @@ GRANT ALL ON FUNCTION "public"."prune_maintenance"("cache_keep_days" integer, "h
 
 
 
+REVOKE ALL ON FUNCTION "public"."refresh_bike_display_images"("p_sources" "text"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."refresh_bike_display_images"("p_sources" "text"[]) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."refresh_company_co2_stats"("p_period" "date", "p_company_ids" "uuid"[]) TO "service_role";
 
@@ -5203,6 +5705,12 @@ GRANT ALL ON FUNCTION "public"."word_similarity_op"("text", "text") TO "service_
 GRANT ALL ON TABLE "public"."app_config" TO "service_role";
 GRANT SELECT ON TABLE "public"."app_config" TO "anon";
 GRANT SELECT ON TABLE "public"."app_config" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."bike_images" TO "anon";
+GRANT ALL ON TABLE "public"."bike_images" TO "authenticated";
+GRANT ALL ON TABLE "public"."bike_images" TO "service_role";
 
 
 

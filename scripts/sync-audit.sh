@@ -5,6 +5,9 @@
 #
 # Read-only. Answers: did the sync fire, did it succeed, did it actually change
 # anything, and is the catalog the app reads still well-formed.
+# Sections 10-17 cover bike photo normalisation (bike-images-nightly + bike-images-tick, a lease
+# queue like the sync): runs, live progress, calls killed by the CPU limit, coverage, failed
+# photos and storage.
 set -euo pipefail
 
 DAYS="${1:-14}"
@@ -96,6 +99,65 @@ q "select count(*) as in_stock,
           count(*) filter (where full_price is null or full_price <= 0) as bad_price,
           count(*) filter (where image_url is null) as no_hero_image
    from public.bikes where in_stock;"
+
+echo
+echo "── 10. Images · Schedule (both must be active) ──"
+q "select jobname, schedule, active from cron.job where jobname like 'bike-images%' order by jobname;"
+
+echo
+echo "── 11. Images · Cron dispatch (any 'failed' row is a red flag) ──"
+q "select j.jobname, d.status, count(*) as fires, max(d.start_time)::timestamp(0) as last_fire
+   from cron.job_run_details d join cron.job j on j.jobid = d.jobid
+   where j.jobname like 'bike-images%' and d.start_time > now() - interval '$DAYS days'
+   group by 1,2 order by 1,2;"
+
+echo
+echo "── 12. Images · Runs (status must be 'succeeded'; 'partial' = some photos failed 3 times) ──"
+q "select started_at::timestamp(0) as started, mode, status, n_units as units, n_normalized as normalized,
+          n_kept as kept, n_unchanged as unchanged, n_failed as failed,
+          round(bytes_downloaded / 1048576.0, 1) as mb_down, round(bytes_stored / 1048576.0, 1) as mb_stored,
+          round(extract(epoch from coalesce(finished_at, now()) - started_at) / 60)::int as minutes
+   from public.bike_image_runs where started_at > now() - interval '$DAYS days' order by started_at desc;"
+
+echo
+echo "── 13. Images · Live progress of a running run ──"
+q "select r.started_at::timestamp(0) as run, u.status, count(*) as units, sum(u.attempts) as attempts
+   from public.bike_image_runs r join public.bike_image_units u on u.run_id = r.id
+   where r.status = 'running' group by 1,2 order by 1,2;"
+
+echo
+echo "── 14. Images · Edge calls (546 = killed by the 2 s CPU limit; pg_net keeps ~6 h) ──"
+q "select date_trunc('hour', created)::timestamp(0) as hour, status_code, count(*) as calls
+   from net._http_response
+   where created > now() - interval '6 hours' and (content like '%claimed%' or content like '%finalized%'
+         or content like '%WORKER_RESOURCE_LIMIT%' or content like '%dry_run%')
+   group by 1,2 order by 1 desc, 2;"
+
+echo
+echo "── 15. Images · Coverage: photos in the feed vs decided ──"
+q "with feed as (
+     select distinct src.url from public.bikes b join public.bike_models m on m.id = b.model_id
+     cross join lateral jsonb_array_elements_text(m.images) as src(url) where b.active)
+   select (select count(*) from feed) as photos_in_feed,
+          (select count(*) from public.bike_images where status = 'normalized') as normalized,
+          (select count(*) from public.bike_images where status = 'kept') as kept,
+          (select count(*) from public.bike_images where status = 'failed') as failed,
+          (select count(*) from public.bike_images_due(1000000, public.bike_images_rule_version())) as due_now,
+          (select count(*) from public.bikes where images::text like '%/bike-images/%') as bikes_showing_copies;"
+
+echo
+echo "── 16. Images · Failed units (3 tries; the app shows the original; due again next night) ──"
+q "select u.finished_at::timestamp(0) as failed_at, u.attempts, left(coalesce(u.error, ''), 50) as error,
+          right(u.source_url, 60) as source
+   from public.bike_image_units u
+   where u.status = 'failed' and u.finished_at > now() - interval '$DAYS days'
+   order by u.finished_at desc limit 15;"
+
+echo
+echo "── 17. Images · Storage: our copies in the bike-images bucket ──"
+q "select count(*) as files, round(sum((metadata->>'size')::bigint) / 1048576.0, 1) as mb,
+          count(*) filter (where name like 'dry-run/%') as dry_run_files
+   from storage.objects where bucket_id = 'bike-images';"
 
 echo
 echo "═══ end ═══"

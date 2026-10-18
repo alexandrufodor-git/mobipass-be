@@ -44,8 +44,8 @@ export function subjectBox(img: Image): { x: number; y: number; w: number; h: nu
   return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 }
 }
 
-// Bump when the rule or the output changes: every older row is re-processed.
-export const RULE_VERSION = 1
+// Changing the rule or its output? Bump public.bike_images_rule_version() in a migration, so every
+// photo decided by the older version is due again.
 const APP_BOX_RATIOS = [1.35, 1.5] // the app's image box (width / 220pt) across phone widths
 
 // True when the app's fill-crop into a box of `ratio` would push part of the bike out of view.

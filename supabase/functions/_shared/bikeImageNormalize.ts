@@ -47,6 +47,29 @@ export function subjectBox(img: Image): { x: number; y: number; w: number; h: nu
 // Changing the rule or its output? Bump public.bike_images_rule_version() in a migration, so every
 // photo decided by the older version is due again.
 const APP_BOX_RATIOS = [1.35, 1.5] // the app's image box (width / 220pt) across phone widths
+// Decoding a bigger photo blows the edge function's 2 s CPU limit per request: keep it as is.
+const MAX_PIXELS = 3_000_000
+
+// Width and height from the file header (PNG IHDR or a JPEG SOF marker), without decoding.
+export function imageSize(bytes: Uint8Array): { width: number; height: number } | null {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  if (bytes.length > 24 && bytes[0] === 0x89 && bytes[1] === 0x50) {
+    return { width: view.getUint32(16), height: view.getUint32(20) }
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let i = 2
+    while (i + 9 < bytes.length) {
+      if (bytes[i] !== 0xff) return null
+      const marker = bytes[i + 1]
+      const length = view.getUint16(i + 2)
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return { width: view.getUint16(i + 7), height: view.getUint16(i + 5) }
+      }
+      i += 2 + length
+    }
+  }
+  return null
+}
 
 // True when the app's fill-crop into a box of `ratio` would push part of the bike out of view.
 export function appCutsSubject(
@@ -64,6 +87,8 @@ export function appCutsSubject(
 // shot the app already shows whole. The bike is never resampled (that jags thin spokes): only the
 // white canvas around it grows to the margin and the 3:2 shape.
 export async function normalizeBikeImage(source: Uint8Array): Promise<Uint8Array | null> {
+  const size = imageSize(source)
+  if (size && size.width * size.height > MAX_PIXELS) return null
   const decoded = await decode(source)
   if (!(decoded instanceof Image)) return null
   const box = subjectBox(decoded)

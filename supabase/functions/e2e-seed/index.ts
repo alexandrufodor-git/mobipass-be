@@ -568,6 +568,7 @@ async function copilotTestYesterday(): Promise<Record<string, unknown>> {
   await patch("bike_benefits", `user_id=eq.${user.id}`, {
     live_test_today_push_at: liveTestAt,
     live_test_confirm_push_at: liveTestAt,
+    live_test_next_day_push_at: null,
   })
   const secret = await getVaultSecret("bike_sync_webhook_secret")
   const res = await fetch(`${SUPABASE_URL}/functions/v1/live-test-push`, {

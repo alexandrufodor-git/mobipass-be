@@ -93,8 +93,10 @@ Deno.serve(async (req) => {
     // Copilot: the test date is already set, so the interest tap books it.
     const copilot = benefit.copilot
     if (res.ok && action === "test_interest" && copilot?.enabled && copilot.live_test_at) {
-      const date = liveTestDayMonth(copilot.live_test_at, copilot.time_zone)
-      claimAndSendLiveTestPush(SUPABASE_URL, SERVICE_KEY, db, userId, "booked", [date], benefit.id)
+      const liveTestAt = copilot.live_test_at
+      Promise.resolve()
+        .then(() => liveTestDayMonth(liveTestAt, copilot.time_zone))
+        .then((date) => claimAndSendLiveTestPush(SUPABASE_URL, SERVICE_KEY, db, userId, "booked", [date], benefit.id))
         .catch((err) => console.error("[onboarding-action] booked push error:", err))
     }
     return res

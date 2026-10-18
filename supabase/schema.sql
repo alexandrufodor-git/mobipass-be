@@ -1612,6 +1612,15 @@ $$;
 ALTER FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_records" "jsonb") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_iana_time_zone"("p_zone" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'pg_catalog'
+    AS $$ SELECT EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = p_zone) $$;
+
+
+ALTER FUNCTION "public"."is_iana_time_zone"("p_zone" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."live_test_due_pushes"() RETURNS TABLE("benefit_id" "uuid", "user_id" "uuid", "kind" "text", "live_test_time" "text")
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1628,7 +1637,9 @@ CREATE OR REPLACE FUNCTION "public"."live_test_due_pushes"() RETURNS TABLE("bene
     ('confirm',  b.live_test_confirm_push_at IS NULL
                  AND now() >= c.live_test_at + make_interval(mins => c.live_test_reminder_offset_min)),
     ('next_day', b.live_test_next_day_push_at IS NULL
+                 AND b.live_test_confirm_push_at IS NOT NULL
                  AND (now() AT TIME ZONE c.time_zone)::date > (c.live_test_at AT TIME ZONE c.time_zone)::date
+                 AND (now() AT TIME ZONE c.time_zone)::date <= (c.live_test_at AT TIME ZONE c.time_zone)::date + 2
                  AND (now() AT TIME ZONE c.time_zone)::time >= time '08:00')
   ) AS k(kind, due)
   WHERE c.copilot_stop_after_commit
@@ -2253,6 +2264,23 @@ COMMENT ON FUNCTION "public"."request_issue_reports_prune"("keep_days" integer) 
 
 
 
+CREATE OR REPLACE FUNCTION "public"."reset_live_test_reminders"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  UPDATE public.bike_benefits b
+  SET live_test_today_push_at = NULL, live_test_confirm_push_at = NULL, live_test_next_day_push_at = NULL
+  FROM public.profiles p
+  WHERE p.user_id = b.user_id AND p.company_id = NEW.id AND b.step = 'book_live_test';
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."reset_live_test_reminders"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."seed_audit_units"("p_run_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -2707,7 +2735,7 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "time_zone" "text" DEFAULT 'Europe/Bucharest'::"text" NOT NULL,
     CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text"))),
     CONSTRAINT "companies_sso_kind_check" CHECK (("sso_kind" = ANY (ARRAY['none'::"text", 'google_oidc'::"text", 'microsoft_oidc'::"text", 'saml'::"text"]))),
-    CONSTRAINT "companies_time_zone_valid" CHECK ((('2000-01-01 00:00:00+00'::timestamp with time zone AT TIME ZONE "time_zone") IS NOT NULL))
+    CONSTRAINT "companies_time_zone_valid" CHECK ("public"."is_iana_time_zone"("time_zone"))
 );
 
 
@@ -3846,6 +3874,10 @@ CREATE OR REPLACE TRIGGER "co2_refresh_benefit_upd" AFTER UPDATE ON "public"."bi
 
 
 
+CREATE OR REPLACE TRIGGER "companies_live_test_at_changed" AFTER UPDATE OF "live_test_at" ON "public"."companies" FOR EACH ROW WHEN (("old"."live_test_at" IS DISTINCT FROM "new"."live_test_at")) EXECUTE FUNCTION "public"."reset_live_test_reminders"();
+
+
+
 CREATE OR REPLACE TRIGGER "metrics_co2_stats_del" AFTER DELETE ON "public"."company_co2_stats" REFERENCING OLD TABLE AS "changed_stats" FOR EACH STATEMENT EXECUTE FUNCTION "public"."metrics_co2_on_stats_change"();
 
 
@@ -4888,6 +4920,12 @@ GRANT ALL ON FUNCTION "public"."ingest_reges_batch"("p_company_id" "uuid", "p_re
 
 
 
+GRANT ALL ON FUNCTION "public"."is_iana_time_zone"("p_zone" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_iana_time_zone"("p_zone" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_iana_time_zone"("p_zone" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."live_test_due_pushes"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."live_test_due_pushes"() TO "service_role";
 
@@ -4974,6 +5012,11 @@ GRANT ALL ON FUNCTION "public"."refresh_company_metrics_counts"("p_company_ids" 
 
 REVOKE ALL ON FUNCTION "public"."request_issue_reports_prune"("keep_days" integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."request_issue_reports_prune"("keep_days" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."reset_live_test_reminders"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."reset_live_test_reminders"() TO "service_role";
 
 
 

@@ -7,19 +7,12 @@ import { type RestClient } from "./supabaseRest.ts"
 
 export type LiveTestPushKind = "booked" | "today" | "confirm" | "next_day"
 
-const STAMP: Record<LiveTestPushKind, string> = {
-  booked:  "live_test_booked_push_at",
-  today:   "live_test_today_push_at",
-  confirm: "live_test_confirm_push_at",
-  next_day: "live_test_next_day_push_at",
-}
-
-export const LIVE_TEST_EVENT = {
-  booked:   NotificationEvent.LIVE_TEST_BOOKED,
-  today:    NotificationEvent.LIVE_TEST_TODAY,
-  confirm:  NotificationEvent.LIVE_TEST_CONFIRM,
-  next_day: NotificationEvent.LIVE_TEST_NEXT_DAY,
-} as const satisfies Record<LiveTestPushKind, string>
+export const LIVE_TEST_PUSH = {
+  booked:   { stamp: "live_test_booked_push_at",   event: NotificationEvent.LIVE_TEST_BOOKED },
+  today:    { stamp: "live_test_today_push_at",    event: NotificationEvent.LIVE_TEST_TODAY },
+  confirm:  { stamp: "live_test_confirm_push_at",  event: NotificationEvent.LIVE_TEST_CONFIRM },
+  next_day: { stamp: "live_test_next_day_push_at", event: NotificationEvent.LIVE_TEST_NEXT_DAY },
+} as const satisfies Record<LiveTestPushKind, { stamp: string; event: string }>
 
 // "30.09" in the company's time zone: the booked push's date arg, numbers only so it reads
 // the same in every language.
@@ -40,7 +33,7 @@ export async function claimAndSendLiveTestPush(
   args: string[],
   bikeBenefitId: string,
 ): Promise<boolean> {
-  const col = STAMP[kind]
+  const col = LIVE_TEST_PUSH[kind].stamp
   const res = await fetch(
     `${supabaseUrl}/rest/v1/bike_benefits?id=eq.${bikeBenefitId}&${col}=is.null&select=id`,
     {
@@ -61,6 +54,6 @@ export async function claimAndSendLiveTestPush(
   const claimed: unknown[] = await res.json()
   if (!claimed.length) return false
 
-  await sendFcm(db, userId, { event: LIVE_TEST_EVENT[kind], bikeBenefitId, args })
+  await sendFcm(db, userId, { event: LIVE_TEST_PUSH[kind].event, bikeBenefitId, args })
   return true
 }

@@ -51,7 +51,6 @@ export const UserRoles = {
 
 export type UserRole = typeof UserRoles[keyof typeof UserRoles]
 
-// Notification event types — mirrors public.notification_event enum in DB.
 // Push codes. The apps own the text: strings notification_<event>_title / _body on both platforms.
 export const NotificationEvent = {
   CONTRACT_READY:     "contract_ready",

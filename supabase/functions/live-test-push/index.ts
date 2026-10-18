@@ -1,6 +1,6 @@
 // supabase/functions/live-test-push/index.ts
 //
-// Sends the copilot "test is today" / "confirm your test" reminders. Called by
+// Sends the copilot "test is today" / "confirm your test" / next-day reminders. Called by
 // public.live_test_tick() (pg_cron, every 5 min) only when someone is due.
 // verify_jwt=false: gated by the same Vault webhook secret as bike-sync.
 
@@ -36,7 +36,8 @@ Deno.serve(async (req) => {
   for (const push of due) {
     try {
       if (await claimAndSendLiveTestPush(
-        SUPABASE_URL, SERVICE_KEY, db, push.user_id, push.kind, push.live_test_time, push.benefit_id,
+        SUPABASE_URL, SERVICE_KEY, db, push.user_id, push.kind,
+        push.kind === "today" ? [push.live_test_time] : [], push.benefit_id,
       )) sent++
     } catch (err) {
       console.error(`[live-test-push] ${push.kind} for ${push.benefit_id} failed:`, err)

@@ -110,10 +110,34 @@ async function getAccessToken(db: RestClient): Promise<string | null> {
 // ─── Send FCM push ──────────────────────────────────────────────────────────
 
 export interface FcmNotification {
-  title: string
-  body: string
   event: NotificationEventType
   bikeBenefitId: string
+  // Values for the body's placeholders, in order. Language-neutral, e.g. "30.09", "10:00".
+  args?: string[]
+}
+
+// No text: both platforms render notification_<event>_title / _body from the app's strings,
+// in the phone's language, even when the app is closed.
+export function fcmMessage(token: string, n: FcmNotification): Record<string, unknown> {
+  const titleKey = `notification_${n.event}_title`
+  const bodyKey = `notification_${n.event}_body`
+  const args = n.args?.length ? n.args : undefined
+  return {
+    token,
+    data: { event: n.event, bike_benefit_id: n.bikeBenefitId },
+    android: {
+      priority: "high",
+      notification: { title_loc_key: titleKey, body_loc_key: bodyKey, ...(args && { body_loc_args: args }) },
+    },
+    apns: {
+      payload: {
+        aps: {
+          alert: { "title-loc-key": titleKey, "loc-key": bodyKey, ...(args && { "loc-args": args }) },
+          sound: "default",
+        },
+      },
+    },
+  }
 }
 
 export async function sendFcm(
@@ -144,11 +168,7 @@ export async function sendFcm(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        message: {
-          token: profile.fcm_token,
-          notification: { title: notification.title, body: notification.body },
-          data: { event: notification.event, bike_benefit_id: notification.bikeBenefitId },
-        },
+        message: fcmMessage(profile.fcm_token, notification),
       }),
     },
   )
@@ -157,6 +177,6 @@ export async function sendFcm(
     const detail = await res.text().catch(() => "")
     console.error("[fcm] send failed:", res.status, detail)
   } else {
-    console.log("[fcm] sent to user:", userId)
+    console.log("[fcm] sent", notification.event, "to user:", userId)
   }
 }

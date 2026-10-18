@@ -8,7 +8,7 @@ import { Errors, badRequest, forbidden, json } from "../_shared/constants.ts"
 import { corsResponse } from "../_shared/ioHelpers.ts"
 import { requireJwt, extractUserId } from "../_shared/auth.ts"
 import { makeRestClient } from "../_shared/supabaseRest.ts"
-import { claimAndSendLiveTestPush } from "../_shared/liveTestPush.ts"
+import { claimAndSendLiveTestPush, liveTestDayMonth } from "../_shared/liveTestPush.ts"
 import { ACTIONS_NEEDING_BIKE, ActionBenefit, FOLLOW_UP, decide, isAction } from "./actions.ts"
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
@@ -91,9 +91,10 @@ Deno.serve(async (req) => {
     }
 
     // Copilot: the test date is already set, so the interest tap books it.
-    const label = benefit.copilot?.live_test_label
-    if (res.ok && action === "test_interest" && benefit.copilot?.enabled && label) {
-      claimAndSendLiveTestPush(SUPABASE_URL, SERVICE_KEY, db, userId, "booked", label, benefit.id)
+    const copilot = benefit.copilot
+    if (res.ok && action === "test_interest" && copilot?.enabled && copilot.live_test_at) {
+      const date = liveTestDayMonth(copilot.live_test_at, copilot.time_zone)
+      claimAndSendLiveTestPush(SUPABASE_URL, SERVICE_KEY, db, userId, "booked", [date], benefit.id)
         .catch((err) => console.error("[onboarding-action] booked push error:", err))
     }
     return res

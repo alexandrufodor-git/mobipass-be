@@ -4,7 +4,7 @@ import { makeRestClient } from "../_shared/supabaseRest.ts"
 import { sendFcm } from "../_shared/fcm.ts"
 import { sendNotification } from "../_shared/notifications.ts"
 import { rsaChunkDecrypt } from "../_shared/tbiCrypto.ts"
-import { loadTbiCallbackPrivateKey, mapTbiStatus, loanStatusMessage } from "../_shared/tbiClient.ts"
+import { loadTbiCallbackPrivateKey, mapTbiStatus, LOAN_PUSH_EVENT } from "../_shared/tbiClient.ts"
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 // PDF examples show status_id quoted as a string ("0", "1", "2"); accept both.
@@ -70,9 +70,7 @@ Deno.serve(async (req) => {
 
     // 5. Notify employee (fire-and-forget)
     sendFcm(db, loan.profile_id, {
-      title: status === "approved" ? "Loan Approved!" : "Loan Update",
-      body: loanStatusMessage(status, data.motiv),
-      event: NotificationEvent.LOAN_STATUS_UPDATE,
+      event: LOAN_PUSH_EVENT[status],
       bikeBenefitId: loan.bike_benefit_id,
     }).catch((err) => console.error("[tbi-webhook] fcm error:", err))
 

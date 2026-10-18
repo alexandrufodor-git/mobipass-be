@@ -20,6 +20,7 @@ export interface Copilot {
   enabled: boolean
   live_test_at: string | null
   live_test_label: string | null
+  time_zone: string
   test_confirmable: boolean
   locked: boolean
 }

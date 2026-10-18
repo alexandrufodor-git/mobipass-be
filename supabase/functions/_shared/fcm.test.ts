@@ -7,7 +7,7 @@
 
 import { assertEquals } from "jsr:@std/assert"
 import { stub } from "jsr:@std/testing/mock"
-import { sendFcm, type FcmNotification } from "./fcm.ts"
+import { fcmMessage, sendFcm, type FcmNotification } from "./fcm.ts"
 import type { RestClient } from "./supabaseRest.ts"
 
 const STS_HOST = "sts.googleapis.com"
@@ -44,8 +44,6 @@ function makeMockDb(rpcReturns: (string | null)[], getOneReturn: unknown = null)
 }
 
 const NOTIFICATION: FcmNotification = {
-  title: "Contract Ready",
-  body: "Your contract is ready to sign.",
   event: "contract_ready",
   bikeBenefitId: "benefit-uuid-001",
 }
@@ -159,8 +157,7 @@ Deno.test("sendFcm: sends push with correct payload on happy path", async () => 
 
     const msg = (fcmCalls[0].body as { message: Record<string, unknown> }).message
     assertEquals(msg.token, "device-token-xyz")
-    assertEquals((msg.notification as Record<string, string>).title, NOTIFICATION.title)
-    assertEquals((msg.notification as Record<string, string>).body, NOTIFICATION.body)
+    assertEquals(msg.notification, undefined, "no English text in the push")
     assertEquals((msg.data as Record<string, string>).event, "contract_ready")
     assertEquals((msg.data as Record<string, string>).bike_benefit_id, "benefit-uuid-001")
   } finally {
@@ -176,4 +173,28 @@ Deno.test("sendFcm: handles FCM API error gracefully without throwing", async ()
   } finally {
     fetchStub.restore()
   }
+})
+
+Deno.test("fcmMessage: codes only, same string keys on both platforms", () => {
+  const msg = fcmMessage("t", NOTIFICATION) as {
+    android: { notification: Record<string, unknown> }
+    apns: { payload: { aps: { alert: Record<string, unknown> } } }
+  }
+  assertEquals(msg.android.notification, {
+    title_loc_key: "notification_contract_ready_title",
+    body_loc_key: "notification_contract_ready_body",
+  })
+  assertEquals(msg.apns.payload.aps.alert, {
+    "title-loc-key": "notification_contract_ready_title",
+    "loc-key": "notification_contract_ready_body",
+  })
+})
+
+Deno.test("fcmMessage: args go to both platforms' placeholders", () => {
+  const msg = fcmMessage("t", { event: "live_test_today", bikeBenefitId: "b1", args: ["10:00"] }) as {
+    android: { notification: Record<string, unknown> }
+    apns: { payload: { aps: { alert: Record<string, unknown> } } }
+  }
+  assertEquals(msg.android.notification.body_loc_args, ["10:00"])
+  assertEquals(msg.apns.payload.aps.alert["loc-args"], ["10:00"])
 })

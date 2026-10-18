@@ -678,6 +678,7 @@ CREATE TABLE IF NOT EXISTS "public"."bike_benefits" (
     "live_test_booked_push_at" timestamp with time zone,
     "live_test_today_push_at" timestamp with time zone,
     "live_test_confirm_push_at" timestamp with time zone,
+    "live_test_next_day_push_at" timestamp with time zone,
     CONSTRAINT "bike_benefits_prior_commute_mode_check" CHECK ((("prior_commute_mode" IS NULL) OR ("prior_commute_mode" = ANY (ARRAY['car'::"text", 'public_transit'::"text", 'bike'::"text", 'walk'::"text", 'motorcycle'::"text", 'other'::"text", 'unknown'::"text"]))))
 );
 
@@ -773,6 +774,10 @@ COMMENT ON COLUMN "public"."bike_benefits"."live_test_confirm_push_at" IS 'Copil
 
 
 
+COMMENT ON COLUMN "public"."bike_benefits"."live_test_next_day_push_at" IS 'Copilot: when the "still not confirmed" next-day push was sent.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."copilot"("public"."bike_benefits") RETURNS "jsonb"
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public'
@@ -780,7 +785,8 @@ CREATE OR REPLACE FUNCTION "public"."copilot"("public"."bike_benefits") RETURNS 
   SELECT jsonb_build_object(
     'enabled',          c.copilot_stop_after_commit,
     'live_test_at',     c.live_test_at,
-    'live_test_label',  to_char(c.live_test_at AT TIME ZONE 'Europe/Bucharest', 'Dy, FMDD Mon · HH24:MI'),
+    'live_test_label',  to_char(c.live_test_at AT TIME ZONE c.time_zone, 'Dy, FMDD Mon · HH24:MI'),
+    'time_zone',        c.time_zone,
     'test_confirmable', c.live_test_at IS NOT NULL
                         AND now() >= c.live_test_at + make_interval(mins => c.live_test_confirm_offset_min),
     'locked',           c.copilot_stop_after_commit
@@ -796,7 +802,7 @@ $_$;
 ALTER FUNCTION "public"."copilot"("public"."bike_benefits") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."copilot"("public"."bike_benefits") IS 'Copilot state for a benefit: enabled, test date + label (Europe/Bucharest), whether the test can be confirmed yet, and whether the bike choice is locked.';
+COMMENT ON FUNCTION "public"."copilot"("public"."bike_benefits") IS 'Copilot state for a benefit: enabled, test date + label and time_zone (the company''s), whether the test can be confirmed yet, and whether the bike choice is locked.';
 
 
 
@@ -1610,17 +1616,20 @@ CREATE OR REPLACE FUNCTION "public"."live_test_due_pushes"() RETURNS TABLE("bene
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT b.id, b.user_id, k.kind, to_char(c.live_test_at AT TIME ZONE 'Europe/Bucharest', 'HH24:MI')
+  SELECT b.id, b.user_id, k.kind, to_char(c.live_test_at AT TIME ZONE c.time_zone, 'HH24:MI')
   FROM public.bike_benefits b
   JOIN public.profiles p  ON p.user_id = b.user_id
   JOIN public.companies c ON c.id = p.company_id
   CROSS JOIN LATERAL (VALUES
-    ('today',   b.live_test_today_push_at IS NULL
-                AND (c.live_test_at AT TIME ZONE 'Europe/Bucharest')::date = (now() AT TIME ZONE 'Europe/Bucharest')::date
-                AND (now() AT TIME ZONE 'Europe/Bucharest')::time >= time '08:00'
-                AND now() < c.live_test_at),
-    ('confirm', b.live_test_confirm_push_at IS NULL
-                AND now() >= c.live_test_at + make_interval(mins => c.live_test_reminder_offset_min))
+    ('today',    b.live_test_today_push_at IS NULL
+                 AND (c.live_test_at AT TIME ZONE c.time_zone)::date = (now() AT TIME ZONE c.time_zone)::date
+                 AND (now() AT TIME ZONE c.time_zone)::time >= time '08:00'
+                 AND now() < c.live_test_at),
+    ('confirm',  b.live_test_confirm_push_at IS NULL
+                 AND now() >= c.live_test_at + make_interval(mins => c.live_test_reminder_offset_min)),
+    ('next_day', b.live_test_next_day_push_at IS NULL
+                 AND (now() AT TIME ZONE c.time_zone)::date > (c.live_test_at AT TIME ZONE c.time_zone)::date
+                 AND (now() AT TIME ZONE c.time_zone)::time >= time '08:00')
   ) AS k(kind, due)
   WHERE c.copilot_stop_after_commit
     AND c.live_test_at IS NOT NULL
@@ -1634,7 +1643,7 @@ $$;
 ALTER FUNCTION "public"."live_test_due_pushes"() OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."live_test_due_pushes"() IS 'Copilot reminders due now: kind today (08:00 Bucharest on the test day, before the test) or confirm (live_test_at + live_test_reminder_offset_min, test not confirmed). Read by live_test_tick() and the live-test-push edge function.';
+COMMENT ON FUNCTION "public"."live_test_due_pushes"() IS 'Copilot reminders due now, in the company''s time_zone: today (08:00 on the test day, before the test), confirm (live_test_at + live_test_reminder_offset_min) or next_day (08:00 after the test day), all only while the test is not confirmed. Read by live_test_tick() and the live-test-push edge function.';
 
 
 
@@ -2447,6 +2456,7 @@ BEGIN
       NEW.live_test_booked_push_at    := NULL;
       NEW.live_test_today_push_at     := NULL;
       NEW.live_test_confirm_push_at   := NULL;
+      NEW.live_test_next_day_push_at  := NULL;
       NEW.contract_status             := NULL;
       NEW.employee_full_price         := NULL;
       NEW.employee_monthly_price      := NULL;
@@ -2694,8 +2704,10 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "live_test_at" timestamp with time zone,
     "live_test_confirm_offset_min" integer DEFAULT 15 NOT NULL,
     "live_test_reminder_offset_min" integer DEFAULT 15 NOT NULL,
+    "time_zone" "text" DEFAULT 'Europe/Bucharest'::"text" NOT NULL,
     CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text"))),
-    CONSTRAINT "companies_sso_kind_check" CHECK (("sso_kind" = ANY (ARRAY['none'::"text", 'google_oidc'::"text", 'microsoft_oidc'::"text", 'saml'::"text"])))
+    CONSTRAINT "companies_sso_kind_check" CHECK (("sso_kind" = ANY (ARRAY['none'::"text", 'google_oidc'::"text", 'microsoft_oidc'::"text", 'saml'::"text"]))),
+    CONSTRAINT "companies_time_zone_valid" CHECK ((('2000-01-01 00:00:00+00'::timestamp with time zone AT TIME ZONE "time_zone") IS NOT NULL))
 );
 
 
@@ -2759,6 +2771,10 @@ COMMENT ON COLUMN "public"."companies"."live_test_confirm_offset_min" IS 'Copilo
 
 
 COMMENT ON COLUMN "public"."companies"."live_test_reminder_offset_min" IS 'Copilot: minutes after live_test_at before the "confirm your test" push.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."time_zone" IS 'IANA time zone of the company, e.g. Europe/Bucharest. Used for push dates, the copilot test label and reminder times.';
 
 
 
@@ -4429,6 +4445,9 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."company_notificat
 
 
 ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."profiles";
+
+
+
 
 
 

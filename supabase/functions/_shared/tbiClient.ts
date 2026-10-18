@@ -1,6 +1,7 @@
 // TBI Bank eCommerce API client — credential loading, payload building, API submission.
 
 import type { RestClient } from "./supabaseRest.ts"
+import { NotificationEvent } from "./constants.ts"
 
 // ─── Vault secret names ─────────────────────────────────────────────────────
 // TBI provides TWO key pairs (PDF: "Two pairs of encryption keys are provided
@@ -250,26 +251,10 @@ export function mapTbiStatus(statusId: number | string, motiv?: string): TbiLoan
   return "pending"
 }
 
-// Map known TBI rejection motiv strings (from PDF) to friendlier text.
-// PDF lists only two; ask TBI integration team for the full catalogue.
-export function mapRejectionMotiv(motiv?: string): string {
-  if (!motiv) return "Your loan application was not approved."
-  const trimmed = motiv.trim()
-  switch (trimmed) {
-    case "Respins Biroul de Credit":
-      return "Loan declined by the credit bureau."
-    case "Criterii eligibilitate":
-      return "Loan declined: eligibility criteria not met."
-    default:
-      return `Loan not approved: ${trimmed}`
-  }
-}
-
-export function loanStatusMessage(status: TbiLoanStatus, motiv?: string): string {
-  switch (status) {
-    case "approved": return "Your loan has been approved! Your e-bike is on its way."
-    case "rejected": return mapRejectionMotiv(motiv)
-    case "canceled": return "Your loan application has been canceled."
-    case "pending": return "Your loan application is being processed."
-  }
-}
+// The rejection reason (motiv) stays on the loan row; the push carries only the code.
+export const LOAN_PUSH_EVENT = {
+  approved: NotificationEvent.LOAN_APPROVED,
+  pending:  NotificationEvent.LOAN_PENDING,
+  rejected: NotificationEvent.LOAN_REJECTED,
+  canceled: NotificationEvent.LOAN_CANCELED,
+} as const satisfies Record<TbiLoanStatus, string>

@@ -12,7 +12,7 @@ const NOW = "2026-09-29T10:00:00.000Z"
 const BIKE = "11111111-1111-1111-1111-111111111111"
 
 function copilot(over: Partial<Copilot> = {}): Copilot {
-  return { enabled: true, live_test_at: null, live_test_label: null, test_confirmable: false, locked: false, ...over }
+  return { enabled: true, live_test_at: null, live_test_label: null, time_zone: "Europe/Bucharest", test_confirmable: false, locked: false, ...over }
 }
 
 function benefit(over: Partial<ActionBenefit> = {}): ActionBenefit {

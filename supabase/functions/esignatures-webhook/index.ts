@@ -74,8 +74,6 @@ async function sendWebhookNotifications(
     // Employer / HR signed → notify the employee via FCM
     if (event === EsigEvents.SIGNED) {
       sendFcm(db, contract.user_id, {
-        title: "Contract Signed",
-        body: "HR has signed your contract.",
         event: NotificationEvent.CONTRACT_SIGNED_HR,
         bikeBenefitId: contract.bike_benefit_id,
       }).catch((err) => console.error("[webhook] fcm error:", err))
@@ -165,8 +163,6 @@ Deno.serve(async (req) => {
     // Fully executed. eSignatures omits a signer email on this event, so notify
     // the employee directly — no signer resolution needed.
     sendFcm(db, contract.user_id, {
-      title: "Contract Approved",
-      body: "Your contract has been fully approved!",
       event: NotificationEvent.CONTRACT_APPROVED,
       bikeBenefitId: contract.bike_benefit_id,
     }).catch((err) => console.error("[webhook] fcm error:", err))

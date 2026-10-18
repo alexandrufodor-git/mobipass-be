@@ -1,22 +1,16 @@
-import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1"
-import { liveTestPushCopy } from "./liveTestPush.ts"
+import { assertEquals } from "jsr:@std/assert@1"
+import { LIVE_TEST_EVENT, liveTestDayMonth } from "./liveTestPush.ts"
 
-Deno.test("booked push names the test date", () => {
-  const n = liveTestPushCopy("booked", "Wed, 30 Sep · 10:00", "b1")
-  assertEquals(n.event, "live_test_booked")
-  assertStringIncludes(n.body, "Wed, 30 Sep · 10:00")
-  assertEquals(n.bikeBenefitId, "b1")
+Deno.test("each live-test kind has its own push code", () => {
+  assertEquals(LIVE_TEST_EVENT.booked, "live_test_booked")
+  assertEquals(LIVE_TEST_EVENT.today, "live_test_today")
+  assertEquals(LIVE_TEST_EVENT.confirm, "live_test_confirm")
+  assertEquals(LIVE_TEST_EVENT.next_day, "live_test_next_day")
 })
 
-Deno.test("today push names the hour", () => {
-  const n = liveTestPushCopy("today", "10:00", "b1")
-  assertEquals(n.event, "live_test_today")
-  assertStringIncludes(n.body, "10:00")
-})
-
-Deno.test("confirm push asks to confirm, no HR promise", () => {
-  const n = liveTestPushCopy("confirm", "", "b1")
-  assertEquals(n.event, "live_test_confirm")
-  assertStringIncludes(n.body, "Confirm your test")
-  assertEquals(n.body.includes("HR"), false)
+Deno.test("booked date arg is dd.MM in the company's time zone", () => {
+  assertEquals(liveTestDayMonth("2026-09-30T07:00:00Z", "Europe/Bucharest"), "30.09")
+  // 22:30 UTC on 30 Sep is already 1 Oct in Bucharest, still 30 Sep in Lisbon.
+  assertEquals(liveTestDayMonth("2026-09-30T22:30:00Z", "Europe/Bucharest"), "01.10")
+  assertEquals(liveTestDayMonth("2026-09-30T22:30:00Z", "Europe/Lisbon"), "30.09")
 })

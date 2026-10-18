@@ -16,6 +16,7 @@ import type { EmailPatternKind } from "../_shared/emailPattern.ts"
  *   Body: { command: "bootstrap" }
  *         { command: "reset", flow: "<flow-name>" }
  *         { command: "copilot_test_due" }  — mid-flow: test day 15 min ago, confirm unlocked
+ *         { command: "copilot_test_yesterday" } — mid-flow: test was yesterday, fires the next-day push
  *
  * Vault secrets (set via scripts/setup-e2e-vault.sh for local, or SQL on prod):
  *   e2e_secret            — required shared secret (matches X-E2E-Secret header)
@@ -556,6 +557,40 @@ async function copilotTestDue(): Promise<Record<string, unknown>> {
   return { ok: true, live_test_at: liveTestAt }
 }
 
+// Test was yesterday and the cron already sent "today" + "confirm"; fire the tick now
+// instead of waiting up to 5 min for pg_cron.
+async function copilotTestYesterday(): Promise<Record<string, unknown>> {
+  const companyId = await ensureCompany()
+  const liveTestAt = new Date(Date.now() - 24 * 3_600_000).toISOString()
+  await patch("companies", `id=eq.${companyId}`, { live_test_at: liveTestAt })
+  const user = await getAuthUserByEmail(ACCOUNT_EMAIL)
+  if (!user) throw new Error("e2e account missing")
+  await patch("bike_benefits", `user_id=eq.${user.id}`, {
+    live_test_today_push_at: liveTestAt,
+    live_test_confirm_push_at: liveTestAt,
+  })
+  const secret = await getVaultSecret("bike_sync_webhook_secret")
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/live-test-push`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-webhook-secret": secret ?? "" },
+    body: "{}",
+  })
+  const push = await res.json().catch(() => ({ status: res.status }))
+  const benefit = await getOne<{ live_test_next_day_push_at: string | null }>(
+    "bike_benefits", `user_id=eq.${user.id}`, "live_test_next_day_push_at",
+  )
+  const company = await getOne<{ time_zone: string }>("companies", `id=eq.${companyId}`, "time_zone")
+  const timeZone = company?.time_zone ?? "Europe/Bucharest"
+  const hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone }).format(new Date()))
+  return {
+    ok: true,
+    live_test_at: liveTestAt,
+    push,
+    due_now: hour >= 8,
+    next_day_push_at: benefit?.live_test_next_day_push_at ?? null,
+  }
+}
+
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
 const json = (body: unknown, status = 200) =>
@@ -591,7 +626,10 @@ Deno.serve(async (req) => {
     if (body.command === "copilot_test_due") {
       return json(await copilotTestDue())
     }
-    return json({ error: "unknown_command", known: ["bootstrap", "reset", "copilot_test_due"] }, 400)
+    if (body.command === "copilot_test_yesterday") {
+      return json(await copilotTestYesterday())
+    }
+    return json({ error: "unknown_command", known: ["bootstrap", "reset", "copilot_test_due", "copilot_test_yesterday"] }, 400)
   } catch (err) {
     console.error("[e2e-seed] error:", err)
     return json({ error: "internal_error", message: (err as Error).message }, 500)

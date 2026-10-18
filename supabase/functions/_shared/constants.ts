@@ -52,12 +52,15 @@ export const UserRoles = {
 export type UserRole = typeof UserRoles[keyof typeof UserRoles]
 
 // Notification event types — mirrors public.notification_event enum in DB.
-// Mobile clients use these keys in FCM data payload for localization.
+// Push codes. The apps own the text: strings notification_<event>_title / _body on both platforms.
 export const NotificationEvent = {
   CONTRACT_READY:     "contract_ready",
   CONTRACT_SIGNED_HR: "contract_signed_hr",
   CONTRACT_APPROVED:  "contract_approved",
-  LOAN_STATUS_UPDATE: "loan_status_update",
+  LOAN_APPROVED:      "loan_approved",
+  LOAN_PENDING:       "loan_pending",
+  LOAN_REJECTED:      "loan_rejected",
+  LOAN_CANCELED:      "loan_canceled",
   // SSO claim review (HR realtime + user FCM when approved/rejected offline)
   SSO_CLAIM_PENDING:  "sso_claim_pending",
   SSO_CLAIM_APPROVED: "sso_claim_approved",
@@ -66,6 +69,7 @@ export const NotificationEvent = {
   LIVE_TEST_BOOKED:   "live_test_booked",
   LIVE_TEST_TODAY:    "live_test_today",
   LIVE_TEST_CONFIRM:  "live_test_confirm",
+  LIVE_TEST_NEXT_DAY: "live_test_next_day",
 } as const
 
 export type NotificationEventType = typeof NotificationEvent[keyof typeof NotificationEvent]

@@ -12,10 +12,12 @@ SET search_path TO extensions, public;
 --  T07 reset to choose_bike clears the push stamps
 --  T08 authenticated can't read the due list or fire the tick
 --  T09 live-test-tick is scheduled every 5 minutes
+--  T10 next_day due when the test was yesterday (Bucharest) and it's past 08:00
+--  T11 next_day not due on the test day itself
 -- ============================================================
 
 BEGIN;
-SELECT plan(9);
+SELECT plan(11);
 
 DO $$
 DECLARE
@@ -81,11 +83,13 @@ SELECT is((SELECT count(*)::int FROM due), 0, 'T06: nothing due with copilot off
 
 -- T07: reset clears the stamps
 UPDATE public.bike_benefits
-SET live_test_booked_push_at = now(), live_test_today_push_at = now(), live_test_confirm_push_at = now()
+SET live_test_booked_push_at = now(), live_test_today_push_at = now(), live_test_confirm_push_at = now(),
+    live_test_next_day_push_at = now()
 WHERE id = current_setting('test.ben_id')::uuid;
 UPDATE public.bike_benefits SET step = 'choose_bike' WHERE id = current_setting('test.ben_id')::uuid;
 SELECT ok(
   (SELECT live_test_booked_push_at IS NULL AND live_test_today_push_at IS NULL AND live_test_confirm_push_at IS NULL
+          AND live_test_next_day_push_at IS NULL
    FROM public.bike_benefits WHERE id = current_setting('test.ben_id')::uuid),
   'T07: reset clears push stamps'
 );
@@ -97,6 +101,28 @@ SELECT ok(
 );
 
 SELECT is((SELECT schedule FROM cron.job WHERE jobname = 'live-test-tick'), '*/5 * * * *', 'T09: tick every 5 minutes');
+
+-- T10/T11: back on step 2 waiting, copilot on, earlier pushes already sent.
+UPDATE public.bike_benefits
+SET step = 'book_live_test', live_test_sent_at = now() - interval '2 days',
+    live_test_today_push_at = now(), live_test_confirm_push_at = now()
+WHERE id = current_setting('test.ben_id')::uuid;
+UPDATE public.companies SET copilot_stop_after_commit = true, live_test_at = now() - interval '1 day'
+WHERE id = current_setting('test.co_id')::uuid;
+SELECT is(
+  (SELECT count(*)::int FROM due WHERE kind = 'next_day'),
+  CASE WHEN (now() AT TIME ZONE 'Europe/Bucharest')::time >= time '08:00' THEN 1 ELSE 0 END,
+  'T10: next_day due after 08:00 the day after the test'
+);
+
+UPDATE public.companies SET live_test_at = now() - interval '1 minute' WHERE id = current_setting('test.co_id')::uuid;
+SELECT is(
+  (SELECT count(*)::int FROM due WHERE kind = 'next_day'),
+  CASE WHEN ((now() - interval '1 minute') AT TIME ZONE 'Europe/Bucharest')::date < (now() AT TIME ZONE 'Europe/Bucharest')::date
+            AND (now() AT TIME ZONE 'Europe/Bucharest')::time >= time '08:00'
+       THEN 1 ELSE 0 END,
+  'T11: next_day not due on the test day'
+);
 
 SELECT * FROM finish();
 ROLLBACK;

@@ -278,8 +278,6 @@ Deno.serve(async (req) => {
 
     // Fire-and-forget FCM push to employee
     sendFcm(db, userId, {
-      title: "Contract Ready",
-      body: "Your contract is ready. Check your email to view and sign.",
       event: NotificationEvent.CONTRACT_READY,
       bikeBenefitId: benefit.id,
     }).catch((err) => console.error("[send-contract] fcm error:", err))

@@ -7,6 +7,8 @@ export interface RestClient {
   upsert(table: string, body: unknown, onConflict?: string): Promise<Response>
   patch(table: string, filter: string, body: unknown): Promise<void>
   rpc<T>(funcName: string, args: unknown): Promise<T>
+  // Like rpc, but a PostgREST error throws instead of coming back as the result.
+  rpcOrThrow<T>(funcName: string, args: unknown): Promise<T>
 }
 
 export function makeRestClient(supabaseUrl: string, serviceKey: string): RestClient {
@@ -64,5 +66,16 @@ export function makeRestClient(supabaseUrl: string, serviceKey: string): RestCli
     return (text ? JSON.parse(text) : null) as T
   }
 
-  return { getOne, post, upsert, patch, rpc }
+  async function rpcOrThrow<T>(funcName: string, args: unknown): Promise<T> {
+    const res = await fetch(`${supabaseUrl}/rest/v1/rpc/${funcName}`, {
+      method: "POST",
+      headers: baseHeaders,
+      body: JSON.stringify(args),
+    })
+    const text = await res.text()
+    if (!res.ok) throw new Error(`rpc ${funcName} ${res.status}: ${text.slice(0, 300)}`)
+    return (text ? JSON.parse(text) : null) as T
+  }
+
+  return { getOne, post, upsert, patch, rpc, rpcOrThrow }
 }

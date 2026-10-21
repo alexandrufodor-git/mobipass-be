@@ -5,32 +5,41 @@
 // secret. Each call claims ONE photo (lease + FOR UPDATE SKIP LOCKED), so it stays far inside the
 // 2 s CPU limit per request, then fires the next. A call killed mid-photo leaves its lease to
 // expire and the tick re-fires the lane; a photo failing 3 times is marked failed and is due again
-// next night. Photos the app would crop get a copy with even white margins in the public
+// next night. Photos the app would crop get a copy with even margins in its studio colour in the public
 // bike-images bucket; every other photo keeps its source URL.
 //
 //   body: { run_id: uuid }                         — worker: one unit of that run
 //         { bike_ids: string[], dry_run: true }    — those bikes' photos into dry-run/, no DB writes
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { makeRestClient, type RestClient } from "../_shared/supabaseRest.ts"
+import { makeRestClient } from "../_shared/supabaseRest.ts"
 import { normalizeBikeImage } from "../_shared/bikeImageNormalize.ts"
-import { bellaHeaders, VAULT_BELLA_CF_ID, VAULT_BELLA_CF_SECRET } from "../_shared/bikeIngest.ts"
+import { bellaHeaders } from "../_shared/bikeIngest.ts"
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-const VAULT_WEBHOOK_SECRET = "bike_sync_webhook_secret"
 const BUCKET = "bike-images"
 const LEASE_SECONDS = 90 // a claimed unit is re-claimable after this if unfinished
 const SOURCE_GAP_MS = 2_000 // polite pacing towards bellabike.ro before firing the next unit
 
-// The source refused us (Cloudflare 403/429): requeue the photo and end the lane.
+// Cloudflare refused us (429, or a 403 its edge answered): requeue the photo and end the lane.
+// A 403 from BellaBike's own storage (CloudFront/S3, e.g. a removed photo) is a normal failure.
 class Throttled extends Error {}
-const refused = (res: Response) => res.status === 403 || res.status === 429
+const refused = (res: Response) =>
+  res.status === 429 || (res.status === 403 && !res.headers.has("x-amz-cf-id"))
 
 interface Unit {
   id: string
   run_id: string
   source_url: string
+  attempts: number
+}
+
+interface WorkerConfig {
+  webhook_secret: string | null
+  cf_id: string | null
+  cf_secret: string | null
+  rule_version: number
 }
 
 interface Known {
@@ -108,15 +117,14 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405)
 
   const db = makeRestClient(SUPABASE_URL, SERVICE_KEY)
-  const secret = await db.rpc<string | null>("get_vault_secret", { secret_name: VAULT_WEBHOOK_SECRET })
-  if (!secret || req.headers.get("x-webhook-secret") !== secret) return json({ error: "forbidden" }, 401)
+  const config = await db.rpcOrThrow<WorkerConfig>("bike_images_worker_config", {})
+  if (!config.webhook_secret || req.headers.get("x-webhook-secret") !== config.webhook_secret) {
+    return json({ error: "forbidden" }, 401)
+  }
 
   const body: { run_id?: string; bike_ids?: string[]; dry_run?: boolean } = await req.json().catch(() => ({}))
-  const sourceHeaders = bellaHeaders(
-    await db.rpc<string | null>("get_vault_secret", { secret_name: VAULT_BELLA_CF_ID }),
-    await db.rpc<string | null>("get_vault_secret", { secret_name: VAULT_BELLA_CF_SECRET }),
-  )
-  const ruleVersion = await db.rpc<number>("bike_images_rule_version", {})
+  const sourceHeaders = bellaHeaders(config.cf_id, config.cf_secret)
+  const ruleVersion = config.rule_version
 
   if (body.dry_run) {
     if (!body.bike_ids?.length) return json({ error: "dry_run_needs_bike_ids" }, 400)
@@ -126,16 +134,21 @@ Deno.serve(async (req) => {
   const runId = body.run_id
 
   // ── Claim one unit (lease) ────────────────────────────────────────────────
-  const unit = await db.rpc<Unit | null>("claim_next_bike_image_unit", {
+  const unit = await db.rpcOrThrow<Unit | null>("claim_next_bike_image_unit", {
     p_run_id: runId,
     p_lease_seconds: LEASE_SECONDS,
   })
   if (!unit || !unit.id) {
     // Nothing claimable: units waiting on retry backoff are left to the tick.
-    const finalized = await db.rpc<{ status?: string }>("finalize_bike_image_run", { p_run_id: runId })
+    const finalized = await db.rpcOrThrow<{ status?: string }>("finalize_bike_image_run", { p_run_id: runId })
     return json({ ok: true, finalized: finalized?.status ?? "unknown" })
   }
 
+  // Writes the photo's result and completes the unit in one transaction, if we still hold the lease.
+  const finish = (args: Record<string, unknown>) =>
+    db.rpcOrThrow<string>("finish_bike_image_unit", { p_unit_id: unit.id, p_attempts: unit.attempts, ...args })
+
+  let result: string
   try {
     const known = await db.getOne<Known>(
       "bike_images",
@@ -143,68 +156,40 @@ Deno.serve(async (req) => {
       "status,rule_version,source_etag,source_bytes",
     )
     const o = await process(unit.source_url, known, ruleVersion, sourceHeaders, false)
-    const checkedAt = new Date().toISOString()
-    if (o.outcome === "unchanged") {
-      await db.patch("bike_images", `source_url=eq.${encodeURIComponent(unit.source_url)}`, { checked_at: checkedAt })
-    } else {
-      const res = await db.upsert("bike_images", {
-        source_url: unit.source_url,
-        status: o.outcome,
-        url: o.url ?? null,
-        source_etag: o.etag,
-        source_bytes: o.bytes,
-        rule_version: ruleVersion,
-        checked_at: checkedAt,
-      }, "source_url")
-      if (!res.ok) throw new Error(`bike_images write ${res.status}: ${await res.text().catch(() => "")}`)
-      await db.rpc("refresh_bike_display_images", { p_sources: [unit.source_url] })
-    }
-    await db.rpc("complete_bike_image_unit", {
-      p_unit_id: unit.id,
+    result = await finish({
       p_status: "succeeded",
       p_outcome: o.outcome,
+      p_url: o.url ?? null,
+      p_etag: o.etag,
+      p_source_bytes: o.bytes,
       p_bytes_downloaded: o.downloaded,
       p_bytes_stored: o.stored,
     })
   } catch (err) {
+    // Also catches a failed finish("succeeded") call, which then ends as "lease lost": not seen on prod yet.
     const msg = err instanceof Error ? err.message : String(err)
     if (err instanceof Throttled) {
+      // Not seen on prod (0 throttles to 21 Oct). If it shows up: count throttles per run, not per photo.
       console.warn(`[bike-image-normalize] source throttled, ending lane: ${msg}`)
-      await db.rpc("complete_bike_image_unit", { p_unit_id: unit.id, p_status: "throttled", p_error: msg })
+      await finish({ p_status: "throttled", p_error: msg })
       return json({ ok: true, throttled: unit.id })
     }
     console.error(`[bike-image-normalize] unit ${unit.id} failed: ${msg}`)
-    const result = await db.rpc<string>("complete_bike_image_unit", {
-      p_unit_id: unit.id,
-      p_status: "failed",
-      p_error: msg.slice(0, 500),
-    })
-    // Out of tries: the app keeps the source (or an earlier copy); due again next night.
-    if (result === "failed") await markFailed(db, unit.source_url, ruleVersion)
+    // Out of tries: the SQL keeps an earlier copy or records the photo as failed.
+    result = await finish({ p_status: "failed", p_error: msg.slice(0, 500) })
+  }
+
+  // Our lease expired and another call owns the unit (and the lane) now.
+  if (result === "stale") {
+    console.warn(`[bike-image-normalize] unit ${unit.id} lease lost (try ${unit.attempts}), result dropped`)
+    return json({ ok: true, stale: unit.id })
   }
 
   // Keep the lane alive (the tick re-fires it if this call dies); pace towards the source.
   await new Promise((r) => setTimeout(r, SOURCE_GAP_MS))
-  await db.rpc("bike_images_invoke", { p_body: { run_id: runId } })
+  await db.rpcOrThrow("bike_images_invoke", { p_body: { run_id: runId } })
   return json({ ok: true, claimed: unit.id })
 })
-
-// A previously normalized photo keeps its copy; anything else is recorded as failed.
-async function markFailed(db: RestClient, sourceUrl: string, ruleVersion: number): Promise<void> {
-  const filter = `source_url=eq.${encodeURIComponent(sourceUrl)}`
-  const known = await db.getOne<{ status: string }>("bike_images", filter, "status")
-  if (known?.status === "normalized") {
-    await db.patch("bike_images", filter, { checked_at: new Date().toISOString() })
-    return
-  }
-  await db.upsert("bike_images", {
-    source_url: sourceUrl,
-    status: "failed",
-    url: null,
-    rule_version: ruleVersion,
-    checked_at: new Date().toISOString(),
-  }, "source_url")
-}
 
 async function dryRun(bikeIds: string[], ruleVersion: number, sourceHeaders: Record<string, string>) {
   const res = await fetch(

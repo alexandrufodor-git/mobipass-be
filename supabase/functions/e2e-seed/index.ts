@@ -17,6 +17,8 @@ import type { EmailPatternKind } from "../_shared/emailPattern.ts"
  *         { command: "reset", flow: "<flow-name>" }
  *         { command: "copilot_test_due" }  — mid-flow: test day 15 min ago, confirm unlocked
  *         { command: "copilot_test_yesterday" } — mid-flow: test was yesterday, fires the next-day push
+ *         { command: "company_settings" } — run.sh snapshot of the company's copilot settings before reset
+ *         { command: "company_settings_restore", settings } — run.sh puts that snapshot back on exit
  *
  * Vault secrets (set via scripts/setup-e2e-vault.sh for local, or SQL on prod):
  *   e2e_secret            — required shared secret (matches X-E2E-Secret header)
@@ -563,6 +565,21 @@ async function copilotTestDue(): Promise<Record<string, unknown>> {
   return { ok: true, live_test_at: liveTestAt }
 }
 
+const COMPANY_SETTINGS = "copilot_stop_after_commit,live_test_at,live_test_confirm_offset_min"
+
+async function companySettings(): Promise<Record<string, unknown>> {
+  const companyId = await ensureCompany()
+  const settings = await getOne<Record<string, unknown>>("companies", `id=eq.${companyId}`, COMPANY_SETTINGS)
+  return { ok: true, settings }
+}
+
+async function companySettingsRestore(settings: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const companyId = await ensureCompany()
+  const keys = COMPANY_SETTINGS.split(",")
+  await patch("companies", `id=eq.${companyId}`, Object.fromEntries(keys.map((k) => [k, settings[k]])))
+  return { ok: true, settings: await getOne<Record<string, unknown>>("companies", `id=eq.${companyId}`, COMPANY_SETTINGS) }
+}
+
 // Test was yesterday and the cron already sent "today" + "confirm"; fire the tick now
 // instead of waiting up to 5 min for pg_cron.
 async function copilotTestYesterday(): Promise<Record<string, unknown>> {
@@ -615,7 +632,7 @@ Deno.serve(async (req) => {
     return json({ error: "forbidden" }, 403)
   }
 
-  let body: { command?: string; flow?: string }
+  let body: { command?: string; flow?: string; settings?: Record<string, unknown> }
   try {
     body = await req.json()
   } catch {
@@ -636,7 +653,14 @@ Deno.serve(async (req) => {
     if (body.command === "copilot_test_yesterday") {
       return json(await copilotTestYesterday())
     }
-    return json({ error: "unknown_command", known: ["bootstrap", "reset", "copilot_test_due", "copilot_test_yesterday"] }, 400)
+    if (body.command === "company_settings") {
+      return json(await companySettings())
+    }
+    if (body.command === "company_settings_restore") {
+      if (!body.settings) return json({ error: "settings_required" }, 400)
+      return json(await companySettingsRestore(body.settings))
+    }
+    return json({ error: "unknown_command", known: ["bootstrap", "reset", "copilot_test_due", "copilot_test_yesterday", "company_settings", "company_settings_restore"] }, 400)
   } catch (err) {
     console.error("[e2e-seed] error:", err)
     return json({ error: "internal_error", message: (err as Error).message }, 500)

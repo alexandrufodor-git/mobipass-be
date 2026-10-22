@@ -3210,6 +3210,8 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "live_test_confirm_offset_min" integer DEFAULT 15 NOT NULL,
     "live_test_reminder_offset_min" integer DEFAULT 15 NOT NULL,
     "time_zone" "text" DEFAULT 'Europe/Bucharest'::"text" NOT NULL,
+    "insurance_provider" "text",
+    "helmet_provider" "text",
     CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text"))),
     CONSTRAINT "companies_sso_kind_check" CHECK (("sso_kind" = ANY (ARRAY['none'::"text", 'google_oidc'::"text", 'microsoft_oidc'::"text", 'saml'::"text"]))),
     CONSTRAINT "companies_time_zone_valid" CHECK ("public"."is_iana_time_zone"("time_zone"))
@@ -3280,6 +3282,14 @@ COMMENT ON COLUMN "public"."companies"."live_test_reminder_offset_min" IS 'Copil
 
 
 COMMENT ON COLUMN "public"."companies"."time_zone" IS 'IANA time zone of the company, e.g. Europe/Bucharest. Used for push dates, the copilot test label and reminder times.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."insurance_provider" IS 'Insurer shown under Addons → Insurance on bike details, e.g. Generali. Null hides the name.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."helmet_provider" IS 'Helmet brand shown under Addons → Helmet on bike details, e.g. Giro. Null hides the name.';
 
 
 
@@ -3380,7 +3390,9 @@ CREATE OR REPLACE VIEW "public"."bikes_with_my_pricing" WITH ("security_invoker"
     "c"."currency",
     "prices"."employee_price" AS "employee_full_price",
     "prices"."monthly_employee_price" AS "employee_monthly_price",
-    "public"."specifications"("b".*) AS "specifications"
+    "public"."specifications"("b".*) AS "specifications",
+    "c"."insurance_provider",
+    "c"."helmet_provider"
    FROM (((("public"."bikes" "b"
      JOIN "public"."dealers" "d" ON (("d"."id" = "b"."dealer_id")))
      LEFT JOIN "public"."profiles" "me" ON (("me"."user_id" = "auth"."uid"())))

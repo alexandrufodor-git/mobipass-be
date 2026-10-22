@@ -87,6 +87,10 @@ const E2E_HOME_LON          = 23.5847
 const E2E_PII_PHONE         = "+40712345678"
 const E2E_PII_SALARY_GROSS  = 6000
 
+// Company addons shown on bike details.
+const E2E_INSURANCE_PROVIDER = "Generali"
+const E2E_HELMET_PROVIDER    = "Giro"
+
 type FlowTarget =
   | "reges_pending"
   | "fresh"
@@ -463,7 +467,7 @@ async function resetToCompleted(userId: string, companyId: string, withAddress: 
   const benefit = (await benefitRes.json() as { id: string }[])[0]
 
   await rest("POST", `/rest/v1/bike_orders`,
-    { user_id: userId, bike_benefit_id: benefit.id, helmet: false },
+    { user_id: userId, bike_benefit_id: benefit.id, helmet: true },
     "return=minimal")
 
   // Stub contracts row so get-employee-details returns a sign_page_url and
@@ -514,6 +518,8 @@ async function applyTarget(target: FlowTarget, companyId: string): Promise<void>
   await patch("companies", `id=eq.${companyId}`, {
     copilot_stop_after_commit: copilot,
     live_test_at: copilot ? new Date(Date.now() + 24 * 3_600_000).toISOString() : null,
+    insurance_provider: E2E_INSURANCE_PROVIDER,
+    helmet_provider: E2E_HELMET_PROVIDER,
   })
   // reges_pending stops here — staged invite + PII, no auth user — so the
   // Maestro register flow performs the real claim + OTP signup itself.

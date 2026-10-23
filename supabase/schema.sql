@@ -1104,7 +1104,7 @@ CREATE OR REPLACE FUNCTION "public"."copilot"("public"."bike_benefits") RETURNS 
                         AND now() >= c.live_test_at + make_interval(mins => c.live_test_confirm_offset_min),
     'locked',           c.copilot_stop_after_commit
                         AND ($1.live_test_sent_at IS NOT NULL
-                             OR $1.step IN ('commit_to_bike', 'sign_contract', 'pickup_delivery'))
+                             OR COALESCE($1.step IN ('commit_to_bike', 'sign_contract', 'pickup_delivery'), false))
   )
   FROM public.profiles p
   JOIN public.companies c ON c.id = p.company_id

@@ -3212,6 +3212,7 @@ CREATE TABLE IF NOT EXISTS "public"."companies" (
     "time_zone" "text" DEFAULT 'Europe/Bucharest'::"text" NOT NULL,
     "insurance_provider" "text",
     "helmet_provider" "text",
+    "show_final_buy" boolean DEFAULT true NOT NULL,
     CONSTRAINT "companies_email_domain_format" CHECK ((("email_domain" = "lower"("email_domain")) AND ("email_domain" ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'::"text"))),
     CONSTRAINT "companies_sso_kind_check" CHECK (("sso_kind" = ANY (ARRAY['none'::"text", 'google_oidc'::"text", 'microsoft_oidc'::"text", 'saml'::"text"]))),
     CONSTRAINT "companies_time_zone_valid" CHECK ("public"."is_iana_time_zone"("time_zone"))
@@ -3290,6 +3291,10 @@ COMMENT ON COLUMN "public"."companies"."insurance_provider" IS 'Insurer shown un
 
 
 COMMENT ON COLUMN "public"."companies"."helmet_provider" IS 'Helmet brand shown under Addons → Helmet on bike details, e.g. Giro. Null hides the name.';
+
+
+
+COMMENT ON COLUMN "public"."companies"."show_final_buy" IS 'Shows the "Final buy" note on bike details (default true). Set false to hide it: presenting buying the bike as an option can conflict with the no-acquisition terms the operational lease relies on (BNR/IFN test, benefit-in-kind, consumer credit).';
 
 
 
@@ -3392,7 +3397,8 @@ CREATE OR REPLACE VIEW "public"."bikes_with_my_pricing" WITH ("security_invoker"
     "prices"."monthly_employee_price" AS "employee_monthly_price",
     "public"."specifications"("b".*) AS "specifications",
     "c"."insurance_provider",
-    "c"."helmet_provider"
+    "c"."helmet_provider",
+    "c"."show_final_buy"
    FROM (((("public"."bikes" "b"
      JOIN "public"."dealers" "d" ON (("d"."id" = "b"."dealer_id")))
      LEFT JOIN "public"."profiles" "me" ON (("me"."user_id" = "auth"."uid"())))

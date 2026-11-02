@@ -94,6 +94,22 @@
 #                                      SUPABASE_SERVICE_ROLE_KEY explicitly.
 #   AUTO_CONFIRM            — set to "true" to skip the TARGET=linked y/N
 #                             prompt. Use in CI; otherwise leave unset.
+#   TIME_ZONE               — Europe/Bucharest (IANA name; test-day label + push times)
+#   SHOW_FINAL_BUY          — true. false hides the "Final buy" note on bike pages.
+#   INSURANCE_PROVIDER      — null. Shown under Addons on bike pages.
+#   HELMET_PROVIDER         — null. Shown under Addons on bike pages.
+#
+# Pilot mode (PILOT=true) — the copilot: steps 1-3 only, stops after commit.
+#   Sets copilot_stop_after_commit=true and checks only what the pilot shows.
+#   Required, no defaults: MONTHLY_BENEFIT_SUBSIDY, CONTRACT_MONTHS, CURRENCY,
+#     INSURANCE_PROVIDER, HELMET_PROVIDER, COPILOT_BIKE_IDS, HR_EMAIL.
+#   COPILOT_BIKE_IDS        — comma-separated bikes.id; each must exist, be
+#                             active and in stock on the target.
+#   LIVE_TEST_AT            — optional ISO time with offset, e.g.
+#                             2026-11-12T10:00:00+02:00. Unset → step 2 says
+#                             "HR will contact you"; set it later in the DB.
+#   Not needed for the pilot (warned if unset, sent if set): ESIGNATURES_TEMPLATE_ID,
+#     EMAIL_PATTERN, ADDRESS/ADDRESS_LAT/ADDRESS_LON, DAYS_IN_OFFICE.
 #
 # Requires: curl, jq, openssl. For TARGET=local, also: supabase CLI running.
 # ============================================================================
@@ -123,6 +139,22 @@ fi
 : "${EMAIL_DOMAIN:?EMAIL_DOMAIN is required (set it in $CONFIG_FILE or inline)}"
 
 TARGET="${TARGET:-linked}"
+PILOT="${PILOT:-false}"
+
+# Pilot mode must not fall back to the defaults below: every value here is on screen.
+PILOT_MISSING=()
+if [[ "$PILOT" == "true" ]]; then
+  for v in MONTHLY_BENEFIT_SUBSIDY CONTRACT_MONTHS CURRENCY INSURANCE_PROVIDER HELMET_PROVIDER COPILOT_BIKE_IDS HR_EMAIL; do
+    [[ -z "${!v:-}" ]] && PILOT_MISSING+=("$v")
+  done
+  if (( ${#PILOT_MISSING[@]} > 0 )); then
+    echo "✗ PILOT=true but these are not set (set them in $CONFIG_FILE or inline):" >&2
+    printf '    %s\n' "${PILOT_MISSING[@]}" >&2
+    exit 1
+  fi
+elif [[ "$PILOT" != "false" ]]; then
+  echo "✗ PILOT must be 'true' or 'false' (got '$PILOT')" >&2; exit 1
+fi
 
 DESCRIPTION="${DESCRIPTION:-}"
 MONTHLY_BENEFIT_SUBSIDY="${MONTHLY_BENEFIT_SUBSIDY:-72.00}"
@@ -136,6 +168,12 @@ ADDRESS_LAT="${ADDRESS_LAT:-}"
 ADDRESS_LON="${ADDRESS_LON:-}"
 DAYS_IN_OFFICE="${DAYS_IN_OFFICE:-5}"
 LOGO_PATH="${LOGO_PATH:-}"
+TIME_ZONE="${TIME_ZONE:-Europe/Bucharest}"
+SHOW_FINAL_BUY="${SHOW_FINAL_BUY:-true}"
+INSURANCE_PROVIDER="${INSURANCE_PROVIDER:-}"
+HELMET_PROVIDER="${HELMET_PROVIDER:-}"
+COPILOT_BIKE_IDS="${COPILOT_BIKE_IDS:-}"
+LIVE_TEST_AT="${LIVE_TEST_AT:-}"
 
 HR_EMAIL="${HR_EMAIL:-hr@$EMAIL_DOMAIN}"
 HR_FIRST_NAME="${HR_FIRST_NAME:-HR}"
@@ -190,6 +228,51 @@ if [[ -n "$EMAIL_PATTERN" ]]; then
       exit 1
       ;;
   esac
+fi
+
+FAILS=()
+WARNS=()
+[[ "$MONTHLY_BENEFIT_SUBSIDY" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || FAILS+=("MONTHLY_BENEFIT_SUBSIDY '$MONTHLY_BENEFIT_SUBSIDY' is not a number like 72 or 72.50")
+[[ "$CONTRACT_MONTHS" =~ ^[1-9][0-9]*$ ]] || FAILS+=("CONTRACT_MONTHS '$CONTRACT_MONTHS' is not a whole number of months")
+[[ "$DAYS_IN_OFFICE" =~ ^[0-7]$ ]] || FAILS+=("DAYS_IN_OFFICE '$DAYS_IN_OFFICE' must be 0-7")
+case "$CURRENCY" in RON|EUR) ;; *) FAILS+=("CURRENCY '$CURRENCY' must be RON or EUR") ;; esac
+case "$SHOW_FINAL_BUY" in true|false) ;; *) FAILS+=("SHOW_FINAL_BUY '$SHOW_FINAL_BUY' must be true or false") ;; esac
+[[ "$TIME_ZONE" == */* ]] || FAILS+=("TIME_ZONE '$TIME_ZONE' is not an IANA name like Europe/Bucharest")
+
+BIKE_IDS_JSON="null"
+if [[ -n "$COPILOT_BIKE_IDS" ]]; then
+  BIKE_IDS_JSON=$(printf '%s' "$COPILOT_BIKE_IDS" | jq -Rc 'split(",") | map(gsub("\\s"; "")) | map(select(. != "")) | unique')
+  for id in $(echo "$BIKE_IDS_JSON" | jq -r '.[]'); do
+    [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || FAILS+=("COPILOT_BIKE_IDS: '$id' is not a lowercase uuid")
+  done
+  [[ "$(echo "$BIKE_IDS_JSON" | jq 'length')" -gt 0 ]] || FAILS+=("COPILOT_BIKE_IDS has no ids")
+fi
+
+if [[ -n "$LIVE_TEST_AT" ]]; then
+  [[ "$LIVE_TEST_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:[0-9]{2})$ ]] \
+    || FAILS+=("LIVE_TEST_AT '$LIVE_TEST_AT' must be ISO with an offset, e.g. 2026-11-12T10:00:00+02:00")
+  [[ "$PILOT" == "true" ]] || WARNS+=("LIVE_TEST_AT is set but PILOT=false: the app only uses it for the copilot")
+fi
+
+if [[ "$PILOT" == "true" ]]; then
+  [[ -n "$LIVE_TEST_AT" ]] || WARNS+=("LIVE_TEST_AT unset: step 2 shows \"HR will contact you\" until companies.live_test_at is set")
+  [[ -n "$LOGO_PATH" ]] || WARNS+=("LOGO_PATH unset: no company logo in the app or the HR dashboard")
+else
+  [[ -n "$ESIGNATURES_TEMPLATE_ID" ]] || WARNS+=("ESIGNATURES_TEMPLATE_ID unset: send-contract fails at step 4")
+  [[ -n "$ADDRESS" && -n "$ADDRESS_LAT" && -n "$ADDRESS_LON" ]] || WARNS+=("ADDRESS/ADDRESS_LAT/ADDRESS_LON incomplete: no work address for address setup and commute numbers")
+  [[ -n "$INSURANCE_PROVIDER" && -n "$HELMET_PROVIDER" ]] || WARNS+=("INSURANCE_PROVIDER/HELMET_PROVIDER unset: empty Addons rows on bike pages")
+  [[ -z "$COPILOT_BIKE_IDS" ]] || WARNS+=("COPILOT_BIKE_IDS set without PILOT=true: the catalog is limited but the flow does not stop after commit")
+fi
+
+if (( ${#FAILS[@]} > 0 )); then
+  echo "✗ invalid config:" >&2
+  printf '    %s\n' "${FAILS[@]}" >&2
+  exit 1
+fi
+if (( ${#WARNS[@]} > 0 )); then
+  echo "⚠ warnings (not blocking):"
+  printf '    %s\n' "${WARNS[@]}"
+  echo
 fi
 
 # Validate LOGO_PATH up front so we fail before mutating the DB.
@@ -291,6 +374,7 @@ echo "Target:       $TARGET"
 echo "Supabase URL: $SUPABASE_URL"
 echo "Company:      $COMPANY_NAME ($EMAIL_DOMAIN)"
 echo "HR account:   $HR_EMAIL"
+echo "Mode:         $([[ "$PILOT" == "true" ]] && echo "pilot (stops after commit)" || echo "full rollout")"
 echo
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -313,6 +397,13 @@ build_company_body() {
     --argjson days_in_office "$DAYS_IN_OFFICE" \
     --arg address_lat "$ADDRESS_LAT" \
     --arg address_lon "$ADDRESS_LON" \
+    --arg time_zone "$TIME_ZONE" \
+    --argjson show_final_buy "$SHOW_FINAL_BUY" \
+    --argjson pilot "$PILOT" \
+    --arg insurance_provider "$INSURANCE_PROVIDER" \
+    --arg helmet_provider "$HELMET_PROVIDER" \
+    --arg live_test_at "$LIVE_TEST_AT" \
+    --argjson copilot_bike_ids "$BIKE_IDS_JSON" \
     '
     {
       name: $name,
@@ -321,7 +412,14 @@ build_company_body() {
       monthly_benefit_subsidy: $monthly_benefit_subsidy,
       contract_months: $contract_months,
       days_in_office: $days_in_office,
+      time_zone: $time_zone,
+      show_final_buy: $show_final_buy,
+      copilot_stop_after_commit: $pilot,
     }
+    + (if $insurance_provider      != "" then {insurance_provider: $insurance_provider} else {} end)
+    + (if $helmet_provider         != "" then {helmet_provider: $helmet_provider} else {} end)
+    + (if $live_test_at            != "" then {live_test_at: $live_test_at} else {} end)
+    + (if $copilot_bike_ids        != null then {copilot_bike_ids: $copilot_bike_ids} else {} end)
     + (if $description             != "" then {description: $description} else {} end)
     + (if $contact_email           != "" then {contact_email: $contact_email} else {} end)
     + (if $esignatures_template_id != "" then {esignatures_template_id: $esignatures_template_id} else {} end)
@@ -357,6 +455,55 @@ admin_delete_user() {
     -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
     -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" > /dev/null || true
 }
+
+rest_get() {
+  curl -sS "$SUPABASE_URL/rest/v1$1" \
+    -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+    -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY"
+}
+
+# ── 0. Checks against the target, before any write ──────────────────────────
+
+echo "[0/5] Checking the target..."
+REMOTE_FAILS=()
+for filter in "email_domain=eq.$EMAIL_DOMAIN" "name=eq.$(jq -rn --arg n "$COMPANY_NAME" '$n|@uri')"; do
+  EXISTING=$(rest_get "/companies?$filter&select=name,email_domain")
+  if ! echo "$EXISTING" | jq -e 'type == "array"' > /dev/null; then
+    echo "✗ could not read companies: $EXISTING" >&2; exit 1
+  fi
+  [[ "$(echo "$EXISTING" | jq 'length')" == "0" ]] \
+    || REMOTE_FAILS+=("a company already has ${filter%%=*} from this config: $(echo "$EXISTING" | jq -c '.[0]')")
+done
+HR_INVITES=$(rest_get "/profile_invites?email=eq.$(jq -rn --arg e "$HR_EMAIL" '$e|ascii_downcase|@uri')&select=id")
+if ! echo "$HR_INVITES" | jq -e 'type == "array"' > /dev/null; then
+  echo "✗ could not read profile_invites: $HR_INVITES" >&2; exit 1
+fi
+[[ "$(echo "$HR_INVITES" | jq 'length')" == "0" ]] || REMOTE_FAILS+=("HR_EMAIL $HR_EMAIL is already on an invite")
+
+if [[ "$BIKE_IDS_JSON" != "null" ]]; then
+  IDS_CSV=$(echo "$BIKE_IDS_JSON" | jq -r 'join(",")')
+  BIKES=$(rest_get "/bikes?id=in.($IDS_CSV)&select=id,name,active,in_stock,available_for_test")
+  if ! echo "$BIKES" | jq -e 'type == "array"' > /dev/null; then
+    echo "✗ could not read bikes: $BIKES" >&2; exit 1
+  fi
+  for id in $(echo "$BIKE_IDS_JSON" | jq -r '.[]'); do
+    ROW=$(echo "$BIKES" | jq -c --arg id "$id" 'map(select(.id == $id)) | .[0] // empty')
+    if [[ -z "$ROW" ]]; then
+      REMOTE_FAILS+=("bike $id does not exist")
+    elif [[ "$(echo "$ROW" | jq '.active and (.in_stock == true)')" != "true" ]]; then
+      REMOTE_FAILS+=("bike $(echo "$ROW" | jq -r '.name') ($id) is not active and in stock: the catalog would not show it")
+    else
+      echo "      ✓ $(echo "$ROW" | jq -r '.name')$(echo "$ROW" | jq -r 'if .available_for_test == false then "  ⚠ available_for_test=false" else "" end')"
+    fi
+  done
+fi
+
+if (( ${#REMOTE_FAILS[@]} > 0 )); then
+  echo "✗ nothing written:" >&2
+  printf '    %s\n' "${REMOTE_FAILS[@]}" >&2
+  exit 1
+fi
+echo "      ✓ name, domain and HR email are free"
 
 # ── 1. Create company ───────────────────────────────────────────────────────
 
@@ -515,3 +662,10 @@ HR account:
 
 Save the password — it isn't recoverable from this script.
 EOF
+
+if [[ "$PILOT" == "true" ]]; then
+  echo
+  echo "Pilot settings as saved:"
+  rest_get "/companies?id=eq.$COMPANY_ID&select=copilot_stop_after_commit,copilot_bike_ids,live_test_at,time_zone,monthly_benefit_subsidy,contract_months,currency,insurance_provider,helmet_provider,show_final_buy,logo_image_path" \
+    | jq '.[0]'
+fi

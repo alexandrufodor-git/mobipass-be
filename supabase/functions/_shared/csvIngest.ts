@@ -67,12 +67,20 @@ function emptyDetails(overrides: Partial<InviteDetails> = {}): InviteDetails {
   }
 }
 
-export async function ingestCsv(
+export function ingestCsv(
   db: RestClient,
   companyId: string,
   csv: string,
 ): Promise<BulkResult[]> {
-  const rows = parseCsv<CsvRow>(csv, ["email", "firstName", "lastName"])
+  return ingestRows(db, companyId, parseCsv<CsvRow>(csv, ["email", "firstName", "lastName"]))
+}
+
+// Shared by the CSV and Excel uploads: same validation, same source='manual' invites.
+export async function ingestRows(
+  db: RestClient,
+  companyId: string,
+  rows: CsvRow[],
+): Promise<BulkResult[]> {
 
   // Track per-row intermediate state so we can do one batched view fetch at
   // the end (instead of N round-trips).

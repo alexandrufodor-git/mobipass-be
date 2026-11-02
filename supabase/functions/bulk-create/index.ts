@@ -1,14 +1,15 @@
 console.info("bulk-create starting")
 
 import { requireRole } from "../_shared/guard.ts"
-import { Errors, badRequest, notFound, json } from "../_shared/constants.ts"
+import { Errors, UPLOAD_EXTENSIONS, UploadKind, badRequest, notFound, json } from "../_shared/constants.ts"
 import {
   corsResponse,
   getBoundary,
-  parseMultipart,
 } from "../_shared/ioHelpers.ts"
-import { makeRestClient } from "../_shared/supabaseRest.ts"
+import { makeRestClient, type RestClient } from "../_shared/supabaseRest.ts"
 import { ingestCsv } from "../_shared/csvIngest.ts"
+import { XlsxError, ingestXlsx } from "../_shared/xlsxIngest.ts"
+import type { BulkResult } from "../_shared/bulkResult.ts"
 import {
   ingestRegesArray,
   type CompanyCtx,
@@ -16,12 +17,12 @@ import {
 } from "../_shared/regesIngest.ts"
 import type { EmailPatternKind } from "../_shared/emailPattern.ts"
 
-// bulk-create dispatches on Content-Type:
-//   - text/csv | multipart with .csv file  → ingestCsv (existing manual flow)
-//   - application/json | multipart .json   → ingestRegesArray (REGES branch)
-//
-// REGES payload contract: a JSON array of `{ referintaSalariat, info }`
-// objects matching the REGES export shape.
+// REGES payload: a JSON array of `{ referintaSalariat, info }` objects (the REGES export shape).
+
+type Upload =
+  | { kind: typeof UploadKind.CSV; text: string }
+  | { kind: typeof UploadKind.XLSX; bytes: Uint8Array }
+  | { kind: typeof UploadKind.REGES; records: unknown }
 
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url)
@@ -58,111 +59,105 @@ Deno.serve(async (req: Request) => {
 
     if ((path === "/bulk-create" || path === "/") && method === "POST") {
       const db = makeRestClient(SUPABASE_URL, SERVICE_KEY)
-      const { payload, kind } = await readPayload(req, origin)
+      const upload = await readPayload(req, origin)
 
-      if (kind === "csv") {
-        const results = await ingestCsv(db, companyId, payload as string)
-        return json({ created: results.length, results }, 200, origin)
+      let results: BulkResult[]
+      switch (upload.kind) {
+        case UploadKind.CSV:   results = await ingestCsv(db, companyId, upload.text); break
+        case UploadKind.XLSX:  results = await ingestXlsx(db, companyId, upload.bytes); break
+        case UploadKind.REGES: results = await ingestReges(db, companyId, upload.records, origin); break
       }
-
-      const records = payload as unknown
-      if (!Array.isArray(records)) {
-        console.error(`[bulk-create] reject=not_array typeof=${typeof records} isNull=${records === null}`)
-        return badRequest(Errors.INVALID_REGES_FORMAT, undefined, origin)
-      }
-
-      // Precondition for REGES branch: company must have email_domain set.
-      // Schema-level NOT NULL + CHECK constraint (see migration
-      // 20260601000001_companies_email_domain_required.sql) makes this
-      // unreachable in practice — kept as defense-in-depth in case the
-      // constraint is ever relaxed.
-      const company = await db.getOne<{
-        id: string; email_domain: string | null; email_pattern: EmailPatternKind | null
-      }>(
-        "companies",
-        `id=eq.${companyId}`,
-        "id,email_domain,email_pattern",
-      )
-      if (!company) return json(Errors.PROFILE_NOT_FOUND, 404, origin)
-      if (!company.email_domain) {
-        return badRequest(Errors.COMPANY_DOMAIN_NOT_CONFIGURED, undefined, origin)
-      }
-      const ctx: CompanyCtx = {
-        id:            company.id,
-        email_domain:  company.email_domain,
-        email_pattern: company.email_pattern,
-      }
-
-      const results = await ingestRegesArray(db, ctx, records as RegesRecord[])
       return json({ created: results.length, results }, 200, origin)
     }
 
     return notFound(path, origin)
   } catch (err) {
-    // Some helpers (requireRole, readPayload) throw a pre-built Response on
-    // policy / validation failures; those carry the user-facing error code
-    // already. Anything else is a real bug — log it (server-side only, no
-    // leak to client) and let it propagate to a 500.
+    // Thrown Responses and XlsxErrors carry the user-facing code; anything else is a bug → logged, 500.
     if (err instanceof Response) return err
+    if (err instanceof XlsxError) {
+      console.error(`[bulk-create] reject=xlsx_${err.body.error}`)
+      return badRequest(err.body, undefined, origin)
+    }
     console.error("[bulk-create] unhandled_error:", err instanceof Error ? err.stack ?? err.message : String(err))
     throw err
   }
 })
 
-// Resolve the upload payload + kind. Supports:
-//   - multipart/form-data with a single .csv, .json, or .txt file
-//     (.txt is treated as JSON because REGES exports may use that extension)
-//   - text/csv raw body
-//   - application/json raw body
-//
-// `origin` is threaded through so the badRequest Response we throw carries
-// proper CORS headers — otherwise the browser blocks the response body and
-// the frontend can't read the error code.
-async function readPayload(
-  req: Request,
-  origin: string,
-): Promise<{ payload: string | unknown; kind: "csv" | "json" }> {
+async function ingestReges(db: RestClient, companyId: string, records: unknown, origin: string): Promise<BulkResult[]> {
+  if (!Array.isArray(records)) {
+    console.error(`[bulk-create] reject=not_array typeof=${typeof records} isNull=${records === null}`)
+    throw badRequest(Errors.INVALID_REGES_FORMAT, undefined, origin)
+  }
+
+  // Defense in depth: the NOT NULL + CHECK on companies.email_domain already makes this unreachable.
+  const company = await db.getOne<{
+    id: string; email_domain: string | null; email_pattern: EmailPatternKind | null
+  }>(
+    "companies",
+    `id=eq.${companyId}`,
+    "id,email_domain,email_pattern",
+  )
+  if (!company) throw json(Errors.PROFILE_NOT_FOUND, 404, origin)
+  if (!company.email_domain) {
+    throw badRequest(Errors.COMPANY_DOMAIN_NOT_CONFIGURED, undefined, origin)
+  }
+  const ctx: CompanyCtx = {
+    id:            company.id,
+    email_domain:  company.email_domain,
+    email_pattern: company.email_pattern,
+  }
+
+  return ingestRegesArray(db, ctx, records as RegesRecord[])
+}
+
+// Own-property lookup only, so a name like "x.constructor" can't pick up Object.prototype members.
+function uploadKindOf(filename: string): UploadKind {
+  const dot = filename.lastIndexOf(".")
+  const ext = dot < 0 ? "" : filename.slice(dot).toLowerCase()
+  return Object.hasOwn(UPLOAD_EXTENSIONS, ext) ? UPLOAD_EXTENSIONS[ext] : UploadKind.CSV
+}
+
+function parseRegesJson(text: string, origin: string, rejectToken: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch (e) {
+    console.error(`[bulk-create] readPayload reject=${rejectToken} body_bytes=${text.length} reason="${e instanceof Error ? e.message : String(e)}"`)
+    throw badRequest(Errors.INVALID_REGES_FORMAT, undefined, origin)
+  }
+}
+
+// `origin` is passed so thrown badRequests carry CORS headers and the browser can read the error code.
+async function readPayload(req: Request, origin: string): Promise<Upload> {
   const ct = req.headers.get("content-type") || ""
   const cl = req.headers.get("content-length") || "?"
   // Diagnostic log — server-side only, no payload contents, just classifiers.
   console.info(`[bulk-create] readPayload ct="${ct}" content_length=${cl}`)
 
   if (ct.startsWith("multipart/form-data")) {
-    const boundary = getBoundary(ct)
-    if (!boundary) {
+    if (!getBoundary(ct)) {
       console.error(`[bulk-create] readPayload reject=missing_boundary ct="${ct}"`)
       throw badRequest(Errors.MISSING_BOUNDARY, undefined, origin)
     }
-    const { files } = await parseMultipart(req)
+    // Native formData keeps the upload as bytes, so binary .xlsx files survive.
+    const files = [...(await req.formData()).values()].filter((v): v is File => v instanceof File)
     const file = files[0]
-    const fname = (file?.filename || "").toLowerCase()
-    const fsize = file?.content?.length ?? 0
-    console.info(`[bulk-create] readPayload branch=multipart files=${files.length} filename="${fname}" file_bytes=${fsize}`)
-    // REGES (Romanian gov platform) sometimes exports JSON with a .txt
-    // extension, so treat .txt the same as .json. If the body isn't valid
-    // JSON we reject — .txt is reserved for REGES payloads here.
-    // To revert: drop the `|| fname.endsWith(".txt")` clause.
-    if (fname.endsWith(".json") || fname.endsWith(".txt")) {
-      try {
-        return { payload: JSON.parse(file.content), kind: "json" }
-      } catch (e) {
-        console.error(`[bulk-create] readPayload reject=multipart_json_parse_failed filename="${fname}" reason="${e instanceof Error ? e.message : String(e)}"`)
-        throw badRequest(Errors.INVALID_REGES_FORMAT, undefined, origin)
-      }
+    if (!file) {
+      console.error(`[bulk-create] readPayload reject=no_file ct="${ct}"`)
+      throw badRequest(Errors.NO_FILE, undefined, origin)
     }
-    // Default to CSV for any other extension (.csv, no extension).
-    return { payload: file.content, kind: "csv" }
+    const kind = uploadKindOf(file.name)
+    console.info(`[bulk-create] readPayload branch=multipart files=${files.length} kind=${kind} filename="${file.name.toLowerCase()}" file_bytes=${file.size}`)
+    switch (kind) {
+      case UploadKind.XLSX:  return { kind, bytes: new Uint8Array(await file.arrayBuffer()) }
+      case UploadKind.REGES: return { kind, records: parseRegesJson(await file.text(), origin, "multipart_json_parse_failed") }
+      case UploadKind.CSV:   return { kind, text: await file.text() }
+    }
   }
 
   if (ct.includes("application/json")) {
     const text = await req.text()
     console.info(`[bulk-create] readPayload branch=application/json body_bytes=${text.length}`)
-    try {
-      return { payload: JSON.parse(text), kind: "json" }
-    } catch (e) {
-      console.error(`[bulk-create] readPayload reject=json_body_parse_failed body_bytes=${text.length} reason="${e instanceof Error ? e.message : String(e)}"`)
-      throw badRequest(Errors.INVALID_REGES_FORMAT, undefined, origin)
-    }
+    return { kind: UploadKind.REGES, records: parseRegesJson(text, origin, "json_body_parse_failed") }
   }
 
   // Plain text body → CSV (covers text/csv and unspecified content-type).
@@ -172,5 +167,5 @@ async function readPayload(
     console.error(`[bulk-create] readPayload reject=empty_csv ct="${ct}"`)
     throw badRequest(Errors.EMPTY_CSV, undefined, origin)
   }
-  return { payload: text, kind: "csv" }
+  return { kind: UploadKind.CSV, text }
 }

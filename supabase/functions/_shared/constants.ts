@@ -51,6 +51,24 @@ export const UserRoles = {
 
 export type UserRole = typeof UserRoles[keyof typeof UserRoles]
 
+// bulk-create upload types. A file whose extension isn't listed is read as CSV.
+export const UploadKind = {
+  CSV:   "csv",
+  XLSX:  "xlsx",
+  REGES: "reges",
+} as const
+
+export type UploadKind = typeof UploadKind[keyof typeof UploadKind]
+
+// REGES exports sometimes use .txt for the same JSON; old binary .xls fails the ZIP read → unreadable_xlsx.
+export const UPLOAD_EXTENSIONS: Readonly<Record<string, UploadKind>> = {
+  ".xlsx": UploadKind.XLSX,
+  ".xlsm": UploadKind.XLSX,
+  ".xls":  UploadKind.XLSX,
+  ".json": UploadKind.REGES,
+  ".txt":  UploadKind.REGES,
+}
+
 // Push codes. The apps own the text: strings notification_<event>_title / _body on both platforms.
 export const NotificationEvent = {
   CONTRACT_READY:     "contract_ready",
@@ -85,6 +103,9 @@ export const Errors = {
   EMPTY_CSV: { error: "empty_csv" },
   NO_ROWS: { error: "no_rows" },
   MISSING_HEADER: { error: "missing_header" },
+  UNREADABLE_XLSX: { error: "unreadable_xlsx" },
+  MISSING_COLUMNS: { error: "missing_columns", reason: "Excel needs a 'Nume' and an 'Email' column" },
+  TOO_MANY_ROWS: { error: "too_many_rows" },
   // General
   NOT_FOUND: { error: "not_found" },
   // Registration
